@@ -1,0 +1,10 @@
+---
+source: src/avalanche.rs
+expression: snapshot
+---
+biases:
+  - 4
+  - 2
+message_bits:
+  - false
+  - false
