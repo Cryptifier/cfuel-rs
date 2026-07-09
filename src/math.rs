@@ -1,4 +1,4 @@
-use bigdecimal::BigDecimal;
+use bigdecimal::{BigDecimal, FromPrimitive};
 use num_bigint::{BigInt, BigUint};
 use num_integer::Integer;
 use num_traits::{One, Signed, ToPrimitive, Zero};
@@ -303,6 +303,38 @@ pub fn mod_inverse(a: &BigUint, modulus: &BigUint) -> Option<BigUint> {
     x.to_biguint()
 }
 
+/// Computes Euler's totient `phi(n)` for an RSA modulus `n = p * q`.
+///
+/// # Parameters
+/// - `p`: First RSA prime factor.
+/// - `q`: Second RSA prime factor.
+///
+/// # Returns
+/// - `BigUint`: `(p - 1) * (q - 1)`.
+///
+/// # Expected Output
+/// - Returns the RSA totient value; no side effects.
+pub fn compute_rsa_phi(p: &BigUint, q: &BigUint) -> BigUint {
+    let one = BigUint::one();
+    (p - &one) * (q - &one)
+}
+
+/// Computes Carmichael's lambda `lambda(n)` for an RSA modulus `n = p * q`.
+///
+/// # Parameters
+/// - `p`: First RSA prime factor.
+/// - `q`: Second RSA prime factor.
+///
+/// # Returns
+/// - `BigUint`: `lcm(p - 1, q - 1)`.
+///
+/// # Expected Output
+/// - Returns the RSA Carmichael function value; no side effects.
+pub fn compute_rsa_lambda(p: &BigUint, q: &BigUint) -> BigUint {
+    let one = BigUint::one();
+    (p - &one).lcm(&(q - &one))
+}
+
 /// Encodes a `BigUint` as a lowercase hexadecimal string.
 ///
 /// # Parameters
@@ -503,6 +535,43 @@ pub fn shannon_entropy_bit(p: f64) -> f64 {
     }
     let q = 1.0 - p;
     -(p * p.log2() + q * q.log2())
+}
+
+/// Returns the cosine of `x` using a big decimal approximation with `digits` precision.
+///
+/// # Parameters
+/// - `x`: The input value as a `BigDecimal`.
+/// - `digits`: The number of digits of precision to use.
+///
+/// # Returns
+/// - `BigDecimal`: The cosine of `x` with `digits` precision.
+pub fn cosine_bigdecimal(x: BigDecimal, digits: i64) -> BigDecimal {
+    let tolerance = pow10_neg(digits + 8);
+
+    let mut sum = BigDecimal::one();
+    let mut term = BigDecimal::one();
+
+    let x2 = &x * &x;
+    for n in 1..20_000_i64 {
+        let denom = BigDecimal::from_i64((2 * n - 1) * (2 * n)).unwrap();
+
+        term = -(&term * &x2) / denom;
+        term = term.with_scale(digits + 16);
+
+        sum += &term;
+        sum = sum.with_scale(digits + 16);
+
+        if term.abs() < tolerance {
+            break;
+        }
+    }
+
+    sum.with_scale(digits)
+}
+
+/// Returns `10^-scale` as a `BigDecimal`.
+fn pow10_neg(scale: i64) -> BigDecimal {
+    BigDecimal::new(1.into(), scale)
 }
 
 /// Samples a probable prime with the specified bit width.

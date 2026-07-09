@@ -5,18 +5,34 @@ edition = "2024"
 
 [dependencies]
 bigdecimal = { version = "0.4", features = ["serde"] }
+diesel = { version = "2.2.4", features = ["sqlite", "r2d2"] }
+hex = "0.4.3"
+linfa = { version = "0.7.0", optional = true }
+linfa-clustering = { version = "0.7.0", optional = true }
+linfa-reduction = { version = "0.7.0", optional = true }
+ndarray = { version = "0.15.6", optional = true }
 num-bigint = { version = "0.4", default-features = false, features = ["std", "serde"] }
 num-integer = "0.1"
+num-rational = "0.4"
 num-traits = "0.2"
 rand = "0.8.5"
 rand_chacha = "0.3.1"
 rayon = "1.10"
+r2d2 = "0.8.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+plotters = { version = "0.3.6", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+zmq = "0.10.0"
 
 [dev-dependencies]
 insta = { version = "1.38.0", features = ["yaml"] }
-serde_json = "1.0"
 
 [features]
-default = []
+default = ["ndarray"]
+plots = ["plotters"]
+pca = ["plots", "linfa", "linfa-reduction", "ndarray"]
+cluster = ["pca", "linfa-clustering"]
 aarch64-hamming-accel = []
 x86-hamming-accel = []

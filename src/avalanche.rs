@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use rayon::prelude::*;
 
 use crate::helpers::{PackedBits, hamming_distance_packed_bytes, pack_bits_to_bytes};
@@ -252,6 +254,10 @@ impl AvalancheInput for AvalancheNode {
     }
 }
 
+/// Anonymous preprocessing pass applied to prepared Avalanche candidates.
+pub type AvalanchePass =
+    Arc<dyn Fn(Vec<AvalancheNode>) -> Result<Vec<AvalancheNode>, AvalancheError> + Send + Sync>;
+
 /// Configuration for a prepared Avalanche run.
 #[derive(Debug, Clone, Default)]
 pub struct AvalancheConfig {
@@ -266,10 +272,19 @@ pub struct AvalancheConfig {
 }
 
 /// Prepared Avalanche reducer built from a shared configuration and candidate set.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Avalanche {
     candidates: Vec<AvalancheNode>,
     config: AvalancheConfig,
+}
+
+impl std::fmt::Debug for Avalanche {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Avalanche")
+            .field("candidates", &self.candidates)
+            .field("config", &self.config)
+            .finish()
+    }
 }
 
 impl Avalanche {
@@ -341,10 +356,21 @@ impl Avalanche {
 }
 
 /// Builder for a prepared Avalanche reducer.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct AvalancheBuilder {
     config: AvalancheConfig,
     candidates: Vec<AvalancheNode>,
+    preprocess_passes: Vec<AvalanchePass>,
+}
+
+impl std::fmt::Debug for AvalancheBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AvalancheBuilder")
+            .field("config", &self.config)
+            .field("candidates", &self.candidates)
+            .field("preprocess_pass_count", &self.preprocess_passes.len())
+            .finish()
+    }
 }
 
 impl AvalancheBuilder {
@@ -422,6 +448,27 @@ impl AvalancheBuilder {
         self
     }
 
+    /// Registers an anonymous preprocessing pass that can filter, sort, or downselect candidates.
+    ///
+    /// # Parameters
+    /// - `pass`: Closure invoked after the built-in preprocessing steps and before execution.
+    ///
+    /// # Returns
+    /// - `AvalancheBuilder`: Updated builder carrying the supplied preprocessing pass.
+    ///
+    /// # Expected Output
+    /// - Returns the updated builder; no stdout/stderr output.
+    pub fn pass<F>(mut self, pass: F) -> Self
+    where
+        F: Fn(Vec<AvalancheNode>) -> Result<Vec<AvalancheNode>, AvalancheError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.preprocess_passes.push(Arc::new(pass));
+        self
+    }
+
     /// Replaces the builder's candidate list from a shared Avalanche input interface.
     ///
     /// # Parameters
@@ -463,6 +510,10 @@ impl AvalancheBuilder {
         }
         if let Some(reference_bits) = self.config.reference_bits.as_deref() {
             candidates = sort_candidates_by_hamming_distance(candidates, reference_bits)?;
+        }
+        for pass in self.preprocess_passes {
+            candidates = pass(candidates)?;
+            validate_candidates(&candidates)?;
         }
 
         Ok(Avalanche {
@@ -1170,8 +1221,9 @@ fn combine_candidates(
 #[cfg(test)]
 mod tests {
     use super::{
-        AvalancheError, AvalancheNode, mirror_inverted_candidates, search_avalanche_tree,
-        search_avalanche_tree_with_scores, sort_candidates_by_hamming_distance,
+        AvalancheBuilder, AvalancheError, AvalancheNode, mirror_inverted_candidates,
+        search_avalanche_tree, search_avalanche_tree_with_scores,
+        sort_candidates_by_hamming_distance,
     };
     use insta::assert_yaml_snapshot;
     use serde_json::json;
@@ -1348,5 +1400,30 @@ mod tests {
         let err = sort_candidates_by_hamming_distance(candidates, &[true])
             .expect_err("expected width mismatch");
         assert_eq!(err, AvalancheError::InconsistentBitWidth);
+    }
+
+    #[test]
+    fn test_avalanche_builder_pass_can_filter_and_reorder_candidates() {
+        let prepared = AvalancheBuilder::new()
+            .candidates(vec![
+                node(&[false, false], &[0.0, 0.0]),
+                node(&[true, false], &[1.0, 1.0]),
+                node(&[true, true], &[2.0, 2.0]),
+            ])
+            .expect("builder candidates should convert")
+            .pass(|mut candidates| {
+                candidates.reverse();
+                candidates.pop();
+                Ok(candidates)
+            })
+            .build()
+            .expect("builder pass should succeed");
+
+        let bits = prepared
+            .candidates()
+            .iter()
+            .map(|node| node.message_bits_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(bits, vec![vec![true, true], vec![true, false]]);
     }
 }

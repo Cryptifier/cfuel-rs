@@ -1,0 +1,2187 @@
+/// Eclipse Public License 2.0
+/// SPDX-License-Identifier: EPL-2.0
+/// Copyright (c) 2025 Nicholas LaRoche <nlaroche@cryptifier.dev>
+use crate::math::{
+    coalesce_factors, factor_composite_with_timeout, floor_biguint_pow_bigdecimal,
+    is_probable_prime_big, next_prime_from_biguint_pow_bigdecimal, pollard_rho,
+    random_bigdecimal_partition_with_min, random_biguint_below, random_biguint_bits,
+};
+use bigdecimal::BigDecimal;
+use num_bigint::BigUint;
+use num_integer::Integer;
+use num_traits::{One, ToPrimitive, Zero};
+use rand::RngCore;
+use rand::seq::SliceRandom;
+use rayon::prelude::*;
+use serde::Deserialize;
+use std::collections::{BTreeMap, HashSet};
+use std::error::Error;
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+};
+use std::time::{Duration, Instant};
+
+use crate::rng::RngChoice;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RCandidateMode {
+    Factoring,
+    SmallPrimes,
+}
+
+impl Default for RCandidateMode {
+    fn default() -> Self {
+        Self::Factoring
+    }
+}
+
+/// Mutable r-candidate metadata used by speculative-oracle flows.
+#[derive(Debug, Clone)]
+pub struct RCandidate {
+    /// Candidate modulus value.
+    pub r: BigUint,
+    /// Prime-power factorization for `r`.
+    pub factors: Vec<(BigUint, u64)>,
+    /// Decimal target exponent used when retargeting this candidate.
+    pub target_exponent: BigDecimal,
+}
+
+impl RCandidate {
+    /// Builds an `RCandidate` with an unset target exponent.
+    ///
+    /// # Parameters
+    /// - `r`: Candidate modulus value.
+    /// - `factors`: Prime-power factorization metadata.
+    ///
+    /// # Returns
+    /// - `RCandidate`: Candidate wrapper around the supplied values.
+    ///
+    /// # Expected Output
+    /// - Returns a new candidate with `target_exponent = 0`; no side effects.
+    pub fn new(r: BigUint, factors: Vec<(BigUint, u64)>) -> Self {
+        Self {
+            r,
+            factors,
+            target_exponent: BigDecimal::zero(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RCandidateSettings {
+    pub mode: RCandidateMode,
+    pub override_best_r: Option<BigUint>,
+    pub process_min_factor: BigUint,
+    pub process_count: u64,
+    pub process_min_count: u64,
+    pub process_scale: u32,
+    pub reuse_retargeted_r_candidates: bool,
+    pub reuse_retargeted_r_candidates_path: String,
+    pub small_primes: Vec<BigUint>,
+    pub small_prime_factors_per_candidate: usize,
+    pub max_factors_per_candidate: usize,
+    pub target_bit_length: Option<u64>,
+    pub random_power_window: bool,
+    pub target_exponent_minimum: BigDecimal,
+    pub target_exponent: BigDecimal,
+    pub retarget_partition_count: usize,
+    pub retarget_minimum_exponent: BigDecimal,
+}
+
+/// Generates `r` candidates using the configured strategy.
+///
+/// # Parameters
+/// - `n`: RSA modulus used to bound/scale candidates in factoring mode.
+/// - `settings`: Candidate generation configuration.
+/// - `rng`: Random number generator for sampling candidates.
+///
+/// # Returns
+/// - `Vec<RCandidate>`: List of mutable candidate records.
+///
+/// # Expected Output
+/// - Returns an empty list when no candidates are found; may print progress logs.
+pub fn generate_r_candidates(
+    n: &BigUint,
+    settings: &RCandidateSettings,
+    rng: &mut RngChoice,
+) -> Vec<RCandidate> {
+    match settings.mode {
+        RCandidateMode::Factoring => generate_r_candidates_via_factoring(n, settings, rng),
+        RCandidateMode::SmallPrimes => {
+            let mut adjusted = settings.clone();
+            if adjusted.target_bit_length.is_none() {
+                adjusted.target_bit_length = n.bits().checked_add(1);
+            }
+            generate_r_candidates_from_small_primes(&adjusted, rng)
+        }
+    }
+}
+
+/// Generates a batch of `r` candidates with a fixed batch size.
+///
+/// # Parameters
+/// - `n`: RSA modulus used to bound/scale candidates in factoring mode.
+/// - `settings`: Candidate generation configuration (cloned and adjusted for batch size).
+/// - `rng`: Random number generator for sampling candidates.
+/// - `batch_size`: Target number of candidates to produce.
+///
+/// # Returns
+/// - `Vec<RCandidate>`: List of mutable candidate records.
+///
+/// # Expected Output
+/// - Returns a list with up to `batch_size` entries; may print progress logs.
+pub fn generate_r_candidates_batch(
+    n: &BigUint,
+    settings: &RCandidateSettings,
+    rng: &mut RngChoice,
+    batch_size: usize,
+) -> Vec<RCandidate> {
+    let target = batch_size.max(1) as u64;
+    let mut batch_settings = settings.clone();
+    batch_settings.process_count = target;
+    batch_settings.process_min_count = target;
+    generate_r_candidates(n, &batch_settings, rng)
+}
+
+/// Resolves the keyed cache path for pre-retargeted r candidates.
+///
+/// # Parameters
+/// - `path_prefix`: Directory-like prefix configured for the retargeted cache family.
+/// - `key_bit_width`: Bit width of the original RSA key used to namespace the cache file.
+///
+/// # Returns
+/// - `String`: Derived cache path ending in `/<bits>.csv`.
+///
+/// # Expected Output
+/// - Returns a deterministic file path; no stdout/stderr output.
+pub fn resolve_retargeted_r_candidates_path(path_prefix: &str, key_bit_width: u64) -> String {
+    let normalized_prefix = path_prefix
+        .trim()
+        .trim_end_matches(".csv")
+        .trim_end_matches('/')
+        .trim_end_matches('\\');
+    let base_dir = if normalized_prefix.is_empty() {
+        "data/rgen_retargeted"
+    } else {
+        normalized_prefix
+    };
+    format!("{base_dir}/{key_bit_width}.csv")
+}
+
+/// Writes r candidates to a CSV file, optionally appending to an existing file.
+///
+/// # Parameters
+/// - `path`: Output CSV path.
+/// - `entries`: Candidate entries to write.
+/// - `append`: Whether to append instead of overwriting.
+/// - `header_lines`: Comment header lines to include when creating a new file.
+///
+/// # Returns
+/// - `Result<usize, Box<dyn Error>>`: Number of candidates written.
+///
+/// # Expected Output
+/// - Writes to disk at `path`; may create or append the file.
+pub fn write_candidates_csv(
+    path: &str,
+    entries: &[RCandidate],
+    append: bool,
+    header_lines: &[String],
+) -> Result<usize, Box<dyn Error>> {
+    if let Some(parent) = Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    let needs_header = if append {
+        fs::metadata(path)
+            .map(|meta| meta.len() == 0)
+            .unwrap_or(true)
+    } else {
+        true
+    };
+
+    let mut file = if append {
+        OpenOptions::new().create(true).append(true).open(path)?
+    } else {
+        OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)?
+    };
+
+    if needs_header {
+        for line in header_lines {
+            writeln!(file, "{line}")?;
+        }
+    }
+
+    for candidate in entries {
+        let factors_str = format_factors_csv(&candidate.factors);
+        writeln!(
+            file,
+            "{},{},{}",
+            candidate.r, candidate.target_exponent, factors_str
+        )?;
+    }
+
+    Ok(entries.len())
+}
+
+/// Loads candidates from a keyed retargeted cache file and validates the modulus binding.
+///
+/// # Parameters
+/// - `path`: Cache file path to read.
+/// - `expected_modulus`: RSA modulus expected to own the cache file.
+///
+/// # Returns
+/// - `Result<Vec<RCandidate>, Box<dyn Error>>`: Parsed candidates when the cache is valid.
+///
+/// # Expected Output
+/// - Reads the cache file and returns an error on key mismatches or invalid rows.
+pub fn load_retargeted_r_candidates(
+    path: &str,
+    expected_modulus: &BigUint,
+) -> Result<Vec<RCandidate>, Box<dyn Error>> {
+    let loaded = load_candidate_file(path)?;
+    if loaded.metadata.is_empty() && loaded.entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let expected_modulus_text = expected_modulus.to_string();
+    let Some(stored_modulus) = loaded.metadata.get("n") else {
+        return Err(format!(
+            "retargeted reuse file {path} is missing # n metadata and cannot be tied to a single key"
+        )
+        .into());
+    };
+    if stored_modulus != &expected_modulus_text {
+        return Err(
+            format!("retargeted reuse file {path} was generated for a different modulus").into(),
+        );
+    }
+    Ok(loaded.entries)
+}
+
+/// Builds retargeted candidates from a freshly generated raw `r` seed batch.
+///
+/// # Parameters
+/// - `n`: RSA modulus used for retargeting.
+/// - `settings`: Candidate settings containing generation and retargeting parameters.
+/// - `rng`: Random number generator used for base generation and retarget sampling.
+/// - `target_count`: Number of retargeted candidates to produce.
+///
+/// # Returns
+/// - `Result<Vec<RCandidate>, Box<dyn Error>>`: Retargeted candidate list.
+///
+/// # Expected Output
+/// - Generates raw seed candidates, prints retarget progress, and returns retargeted candidates.
+pub fn generate_retargeted_r_candidates_batch(
+    n: &BigUint,
+    settings: &RCandidateSettings,
+    rng: &mut RngChoice,
+    target_count: usize,
+) -> Result<Vec<RCandidate>, Box<dyn Error>> {
+    let count = target_count.max(1);
+    println!("Generating {} base r candidates for retargeting", count);
+    let mut retarget_inputs = build_seed_r_candidates_for_retargeting(n, settings, rng, count);
+    if retarget_inputs.is_empty() {
+        return Err("no base r candidates generated for retargeting".into());
+    }
+    println!(
+        "Generated {} base r candidates for retarget cache generation",
+        retarget_inputs.len()
+    );
+    retarget_r_candidates_for_speculative_oracles(
+        n,
+        &mut retarget_inputs,
+        &settings.target_exponent_minimum,
+        &settings.target_exponent,
+        settings.retarget_partition_count,
+        &settings.retarget_minimum_exponent,
+        rng,
+    );
+    Ok(retarget_inputs)
+}
+
+/// Builds a raw `r` seed batch sized for the requested retarget workload.
+///
+/// # Parameters
+/// - `n`: RSA modulus used for candidate generation.
+/// - `settings`: Candidate settings controlling raw generation.
+/// - `rng`: Random number generator used for raw candidate generation.
+/// - `target_count`: Number of candidates needed after expansion.
+///
+/// # Returns
+/// - `Vec<RCandidate>`: Raw candidate seeds ready for retargeting.
+///
+/// # Expected Output
+/// - Returns one generated seed cloned to `target_count` when retargeting is enabled, or a fully
+///   generated raw batch when retargeting is disabled; may print progress logs.
+fn build_seed_r_candidates_for_retargeting(
+    n: &BigUint,
+    settings: &RCandidateSettings,
+    rng: &mut RngChoice,
+    target_count: usize,
+) -> Vec<RCandidate> {
+    let count = target_count.max(1);
+    if settings.retarget_partition_count == 0 {
+        return generate_r_candidates_batch(n, settings, rng, count);
+    }
+
+    let mut seeds = generate_r_candidates_batch(n, settings, rng, 1);
+    if seeds.is_empty() {
+        return seeds;
+    }
+    let seed = seeds.swap_remove(0);
+    vec![seed; count]
+}
+
+/// Builds header metadata for a retargeted r-candidate cache file.
+///
+/// # Parameters
+/// - `n`: RSA modulus bound to the cache file.
+///
+/// # Returns
+/// - `Vec<String>`: Header lines written before the first cached candidate row.
+///
+/// # Expected Output
+/// - Returns in-memory header lines; no stdout/stderr output.
+fn build_retargeted_cache_header_lines(n: &BigUint) -> Vec<String> {
+    vec![
+        "# analysis retargeted_r_candidates cache".to_string(),
+        "# retargeted=true".to_string(),
+        format!("# n={n}"),
+        "# columns=r,target_exponent,factors".to_string(),
+    ]
+}
+
+/// Loads and extends a retargeted r-candidate cache until it can satisfy the requested batch size.
+///
+/// # Parameters
+/// - `n`: RSA modulus used for cache validation and fresh retargeting.
+/// - `settings`: Candidate settings containing the cache path and retarget parameters.
+/// - `rng`: Random number generator used for fresh seed generation and retarget sampling.
+/// - `batch_size`: Number of retargeted candidates requested by the caller.
+///
+/// # Returns
+/// - `Result<Vec<RCandidate>, Box<dyn Error>>`: Cached plus newly generated candidates truncated to `batch_size`.
+///
+/// # Expected Output
+/// - Reads and appends the keyed cache file as needed; may create cache directories and print cache progress logs.
+fn prepare_cached_retargeted_r_candidates(
+    n: &BigUint,
+    settings: &RCandidateSettings,
+    rng: &mut RngChoice,
+    batch_size: usize,
+) -> Result<Vec<RCandidate>, Box<dyn Error>> {
+    let target_count = batch_size.max(1);
+    println!(
+        "Retargeted cache enabled; loading up to {} candidates from {}",
+        target_count, settings.reuse_retargeted_r_candidates_path
+    );
+    let mut cached = load_retargeted_r_candidates(&settings.reuse_retargeted_r_candidates_path, n)?;
+    let mut seen_r: HashSet<BigUint> = cached.iter().map(|candidate| candidate.r.clone()).collect();
+    let header_lines = build_retargeted_cache_header_lines(n);
+    let mut attempts = 0usize;
+    let attempt_limit = target_count.saturating_mul(4).max(4);
+
+    while cached.len() < target_count {
+        let missing = target_count - cached.len();
+        println!(
+            "Retargeted cache short by {} candidates; generating fresh seed-backed entries",
+            missing
+        );
+        let generated = generate_retargeted_r_candidates_batch(n, settings, rng, missing)?;
+        let mut unique_generated = Vec::new();
+        for candidate in generated {
+            if seen_r.insert(candidate.r.clone()) {
+                unique_generated.push(candidate);
+            }
+        }
+
+        if unique_generated.is_empty() {
+            attempts = attempts.saturating_add(1);
+            if attempts >= attempt_limit {
+                return Err(format!(
+                    "unable to extend retargeted cache {} to {} unique candidates",
+                    settings.reuse_retargeted_r_candidates_path, target_count
+                )
+                .into());
+            }
+            continue;
+        }
+
+        write_candidates_csv(
+            &settings.reuse_retargeted_r_candidates_path,
+            &unique_generated,
+            true,
+            &header_lines,
+        )?;
+        cached.extend(unique_generated);
+        attempts = 0;
+    }
+
+    cached.shuffle(rng);
+    cached.truncate(target_count);
+    Ok(cached)
+}
+
+/// Prepares a batch of speculative r candidates, optionally loading and extending a keyed retargeted cache.
+///
+/// # Parameters
+/// - `n`: RSA modulus used for candidate generation and cache validation.
+/// - `settings`: Candidate settings controlling generation, retargeting, and cache paths.
+/// - `rng`: Random number generator used for sampling and shuffling.
+/// - `batch_size`: Target number of candidates to prepare.
+///
+/// # Returns
+/// - `Result<Vec<RCandidate>, Box<dyn Error>>`: Prepared candidate batch or an error when cache loading or extension fails.
+///
+/// # Expected Output
+/// - May print reuse and retarget progress logs and append generated retargeted candidates to disk when cache reuse is enabled.
+pub fn prepare_r_candidates_batch(
+    n: &BigUint,
+    settings: &RCandidateSettings,
+    rng: &mut RngChoice,
+    batch_size: usize,
+) -> Result<Vec<RCandidate>, Box<dyn Error>> {
+    if settings.reuse_retargeted_r_candidates {
+        return prepare_cached_retargeted_r_candidates(n, settings, rng, batch_size);
+    }
+
+    let mut candidates = build_seed_r_candidates_for_retargeting(n, settings, rng, batch_size);
+    retarget_r_candidates_for_speculative_oracles(
+        n,
+        &mut candidates,
+        &settings.target_exponent_minimum,
+        &settings.target_exponent,
+        settings.retarget_partition_count,
+        &settings.retarget_minimum_exponent,
+        rng,
+    );
+    Ok(candidates)
+}
+
+/// Generates `r` candidates from a ciphertext stream using `r = c^x mod n`.
+///
+/// # Parameters
+/// - `ciphertext`: Ciphertext value reduced modulo `n`.
+/// - `n`: RSA modulus used for modular exponentiation.
+/// - `count`: Number of `r` candidates to produce.
+/// - `start_exponent`: Initial exponent `x` (increments by one per candidate).
+///
+/// # Returns
+/// - `Vec<RCandidate>`: List of candidate records with empty factor lists.
+///
+/// # Expected Output
+/// - Returns a deterministic sequence; no stdout/stderr output.
+pub fn generate_r_candidates_from_ciphertext_stream(
+    ciphertext: &BigUint,
+    n: &BigUint,
+    count: usize,
+    start_exponent: u64,
+) -> Vec<RCandidate> {
+    if count == 0 || n.is_zero() {
+        return Vec::new();
+    }
+
+    let mut exponent = start_exponent;
+    let mut results = Vec::with_capacity(count);
+    for _ in 0..count {
+        let r = ciphertext_stream_next(ciphertext, n, &mut exponent);
+        results.push(RCandidate::new(r, Vec::new()));
+    }
+    results
+}
+
+/// Computes the next ciphertext-derived `r` using `r = c^x mod n`.
+///
+/// # Parameters
+/// - `ciphertext`: Ciphertext value reduced modulo `n`.
+/// - `n`: RSA modulus for modular exponentiation.
+/// - `exponent`: Mutable exponent counter, incremented after each use.
+///
+/// # Returns
+/// - `BigUint`: Next `r` value in the sequence.
+///
+/// # Expected Output
+/// - Increments `exponent` by one; no stdout/stderr output.
+fn ciphertext_stream_next(ciphertext: &BigUint, n: &BigUint, exponent: &mut u64) -> BigUint {
+    let exp = BigUint::from(*exponent);
+    *exponent = exponent.saturating_add(1);
+    ciphertext.modpow(&exp, n)
+}
+
+/// Builds `r` candidates by combining small primes with generated larger primes.
+///
+/// # Parameters
+/// - `settings`: Candidate generation configuration (uses `small_primes` list).
+/// - `rng`: Random number generator for shuffling prime selections.
+///
+/// # Returns
+/// - `Vec<RCandidate>`: List of mutable candidate records.
+///
+/// # Expected Output
+/// - Returns an empty list if not enough primes are available; may print progress logs.
+pub fn generate_r_candidates_from_small_primes(
+    settings: &RCandidateSettings,
+    rng: &mut RngChoice,
+) -> Vec<RCandidate> {
+    let count = settings
+        .process_count
+        .max(settings.process_min_count)
+        .max(1) as usize;
+    let target_count = count.max(1);
+    let target_bits = settings.target_bit_length;
+    let min_small_factors = settings.small_prime_factors_per_candidate.max(1);
+    let max_factors = settings
+        .max_factors_per_candidate
+        .max(min_small_factors + 1);
+
+    let mut collected: Vec<RCandidate> = Vec::new();
+    let mut seen: HashSet<BigUint> = HashSet::new();
+
+    let Some(target_bits) = target_bits else {
+        return collected;
+    };
+
+    if target_bits == 0 || max_factors <= min_small_factors {
+        return collected;
+    }
+
+    let min_factor = settings.process_min_factor.clone();
+    let mut primes: Vec<BigUint> = settings
+        .small_primes
+        .iter()
+        .filter(|p| *p >= &min_factor)
+        .cloned()
+        .collect();
+    primes.sort();
+
+    if primes.len() < min_small_factors {
+        return collected;
+    }
+
+    let max_small_prime = primes.last().cloned().unwrap_or_else(|| BigUint::from(2u8));
+    let min_large_value = if max_small_prime >= min_factor {
+        &max_small_prime + BigUint::one()
+    } else {
+        min_factor.clone()
+    };
+    let min_large_bits = min_large_value.bits().max(2);
+
+    let remaining = target_count.saturating_sub(collected.len());
+    if remaining == 0 {
+        return collected;
+    }
+
+    let max_attempts = remaining.saturating_mul(250).max(10);
+    let mut seeds = Vec::with_capacity(max_attempts);
+    for _ in 0..max_attempts {
+        seeds.push(rng.next_u64());
+    }
+
+    let found = Arc::new(AtomicUsize::new(0));
+    let generation_started_at = Instant::now();
+    let attempts_done = Arc::new(AtomicU64::new(0));
+    let next_progress_log_at_ms = Arc::new(AtomicU64::new(
+        Duration::from_secs(5).as_millis().min(u128::from(u64::MAX)) as u64,
+    ));
+    let total_attempts = u64::try_from(seeds.len()).unwrap_or(u64::MAX);
+    let target_generation_count = u64::try_from(remaining).unwrap_or(u64::MAX);
+    println!(
+        "Generating {} r candidates from small primes over {} attempts",
+        remaining,
+        seeds.len()
+    );
+    let generated = seeds
+        .into_par_iter()
+        .filter_map(|seed| {
+            if found.load(Ordering::Relaxed) >= remaining {
+                return None;
+            }
+            let result = (|| {
+                let mut local_rng = RngChoice::from_seed(rng.mode(), seed);
+                let candidate = build_small_primes_candidate(
+                    target_bits,
+                    min_large_bits,
+                    &min_large_value,
+                    &primes,
+                    min_small_factors,
+                    max_factors,
+                    &mut local_rng,
+                )?;
+                let prev = found.fetch_add(1, Ordering::Relaxed);
+                if prev >= remaining {
+                    None
+                } else {
+                    Some(candidate)
+                }
+            })();
+            let attempts_count = attempts_done.fetch_add(1, Ordering::Relaxed) + 1;
+            let accepted_count =
+                u64::try_from(found.load(Ordering::Relaxed).min(remaining)).unwrap_or(u64::MAX);
+            log_generation_status_every_interval(
+                attempts_count,
+                total_attempts,
+                accepted_count,
+                target_generation_count,
+                &generation_started_at,
+                &next_progress_log_at_ms,
+                "Small-primes r candidate generation",
+                Duration::from_secs(5),
+            );
+            result
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "Small-primes r candidate generation progress: accepted {}/{} attempts {}/{} elapsed {:.1}s",
+        found.load(Ordering::Relaxed).min(remaining),
+        remaining,
+        attempts_done.load(Ordering::Relaxed),
+        total_attempts,
+        generation_started_at.elapsed().as_secs_f64(),
+    );
+
+    for entry in generated {
+        if collected.len() >= target_count {
+            break;
+        }
+        if seen.insert(entry.r.clone()) {
+            collected.push(entry);
+        }
+    }
+
+    collected.truncate(target_count);
+    collected
+}
+
+const MAX_LARGE_PRIME_ATTEMPTS: usize = 128;
+const POLLARD_RHO_PRIMALITY_TIMEOUT_MS: u64 = 25;
+const RANDOM_POWER_WINDOW_MIN_UNITS: u64 = 800;
+const RANDOM_POWER_WINDOW_MAX_UNITS: u64 = 900;
+const RANDOM_POWER_WINDOW_SCALE_UNITS: u64 = 1000;
+const RETARGET_EXPONENT_SCALE_UNITS: u64 = 1000;
+
+/// Logs r-candidate generation status at fixed wall-clock intervals.
+///
+/// # Parameters
+/// - `attempts_done`: Number of generation attempts processed so far.
+/// - `total_attempts`: Total number of generation attempts scheduled.
+/// - `accepted_count`: Number of provisional candidates accepted so far.
+/// - `target_count`: Target number of candidates requested for the run.
+/// - `start`: Start time of the generation phase.
+/// - `next_log_at_ms`: Shared elapsed-millisecond deadline for the next status print.
+/// - `label`: Human-readable label for the generation phase.
+/// - `interval`: Minimum duration between progress prints.
+///
+/// # Returns
+/// - `()`: This function returns nothing.
+///
+/// # Expected Output
+/// - Prints periodic status updates to stdout while generation is running.
+fn log_generation_status_every_interval(
+    attempts_done: u64,
+    total_attempts: u64,
+    accepted_count: u64,
+    target_count: u64,
+    start: &Instant,
+    next_log_at_ms: &AtomicU64,
+    label: &str,
+    interval: Duration,
+) {
+    let elapsed_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    let interval_ms = interval.as_millis().min(u128::from(u64::MAX)) as u64;
+    let generation_complete = accepted_count >= target_count || attempts_done >= total_attempts;
+    loop {
+        let scheduled_ms = next_log_at_ms.load(Ordering::Relaxed);
+        if !generation_complete && elapsed_ms < scheduled_ms {
+            return;
+        }
+
+        let next_deadline_ms = if generation_complete {
+            u64::MAX
+        } else {
+            scheduled_ms.saturating_add(interval_ms)
+        };
+        if next_log_at_ms
+            .compare_exchange(
+                scheduled_ms,
+                next_deadline_ms,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            println!(
+                "{label} progress: accepted {accepted_count}/{target_count} attempts {attempts_done}/{total_attempts} elapsed {:.1}s",
+                start.elapsed().as_secs_f64(),
+            );
+            return;
+        }
+    }
+}
+
+/// Builds a single r candidate from distinct small primes and generated larger primes.
+///
+/// # Parameters
+/// - `target_bits`: Target bit length derived from the RSA modulus.
+/// - `min_large_bits`: Minimum bit length required for large primes.
+/// - `min_large_value`: Minimum value for large primes to ensure they exceed small primes.
+/// - `small_primes`: Available small prime list (all >= min_factor).
+/// - `small_factor_count`: Number of small prime factors to include.
+/// - `max_factors`: Maximum total factor count per candidate.
+/// - `rng`: Random number generator for selecting primes.
+///
+/// # Returns
+/// - `Option<RCandidate>`: Candidate record or `None` if invalid.
+///
+/// # Expected Output
+/// - Returns `None` when the constraints cannot be met; no side effects.
+fn build_small_primes_candidate(
+    target_bits: u64,
+    min_large_bits: u64,
+    min_large_value: &BigUint,
+    small_primes: &[BigUint],
+    small_factor_count: usize,
+    max_factors: usize,
+    rng: &mut RngChoice,
+) -> Option<RCandidate> {
+    if small_factor_count == 0 || max_factors <= small_factor_count {
+        return None;
+    }
+
+    let mut indices: Vec<usize> = (0..small_primes.len()).collect();
+    indices.shuffle(rng);
+    let selected = indices
+        .into_iter()
+        .take(small_factor_count)
+        .collect::<Vec<_>>();
+
+    let mut r = BigUint::one();
+    let mut factors = Vec::with_capacity(max_factors);
+    for idx in selected {
+        let p = &small_primes[idx];
+        r *= p;
+        factors.push((p.clone(), 1));
+    }
+
+    let remaining_budget = max_factors - small_factor_count;
+    let remaining_bits = target_bits.saturating_sub(r.bits());
+    if remaining_bits < min_large_bits {
+        return None;
+    }
+
+    let max_large_count = remaining_budget
+        .min((remaining_bits / min_large_bits) as usize)
+        .max(1);
+    let large_count = if max_large_count == 1 {
+        1
+    } else {
+        (rng.next_u64() as usize % max_large_count) + 1
+    };
+
+    for idx in 0..large_count {
+        let remaining_primes = large_count - idx;
+        let bits_left = target_bits.saturating_sub(r.bits());
+        if bits_left == 0 {
+            return None;
+        }
+
+        let min_bits_required = min_large_bits * remaining_primes as u64;
+        if bits_left < min_bits_required {
+            return None;
+        }
+
+        let bits_for_prime = if remaining_primes == 1 {
+            bits_left
+        } else {
+            let max_bits_for_prime = bits_left - min_large_bits * (remaining_primes as u64 - 1);
+            let span = max_bits_for_prime.saturating_sub(min_large_bits);
+            if span == 0 {
+                min_large_bits
+            } else {
+                min_large_bits + (rng.next_u64() % (span + 1))
+            }
+        };
+
+        let prime =
+            sample_large_prime_with_pollard(bits_for_prime, min_large_value, &factors, rng)?;
+        r *= &prime;
+        if r.bits() > target_bits {
+            return None;
+        }
+        factors.push((prime, 1));
+    }
+
+    if factors.len() <= small_factor_count {
+        return None;
+    }
+
+    factors.sort_by(|a, b| a.0.cmp(&b.0));
+    Some(RCandidate::new(r, factors))
+}
+
+/// Samples a prime candidate of the requested bit width and validates it with Pollard Rho.
+///
+/// # Parameters
+/// - `bits`: Bit width for the prime candidate.
+/// - `min_value`: Minimum acceptable prime value.
+/// - `used_factors`: Existing factors to avoid reuse.
+/// - `rng`: Random number generator for sampling.
+///
+/// # Returns
+/// - `Option<BigUint>`: A prime of the requested size or `None` on failure.
+///
+/// # Expected Output
+/// - Returns `None` when sampling fails within the attempt budget; no side effects.
+fn sample_large_prime_with_pollard(
+    bits: u64,
+    min_value: &BigUint,
+    used_factors: &[(BigUint, u64)],
+    rng: &mut RngChoice,
+) -> Option<BigUint> {
+    if bits < 2 {
+        return None;
+    }
+    let bits_u32 = u32::try_from(bits).ok()?;
+    if min_value.bits() > bits {
+        return None;
+    }
+
+    for _ in 0..MAX_LARGE_PRIME_ATTEMPTS {
+        let mut candidate = random_biguint_bits(bits_u32, rng);
+        candidate |= BigUint::one();
+        if &candidate <= min_value {
+            continue;
+        }
+        if used_factors.iter().any(|(p, _)| p == &candidate) {
+            continue;
+        }
+        if !is_probable_prime_big(&candidate) {
+            continue;
+        }
+        let deadline = Instant::now() + Duration::from_millis(POLLARD_RHO_PRIMALITY_TIMEOUT_MS);
+        if pollard_rho(&candidate, rng, deadline).is_none() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+/// Samples a random exponent in the factoring-mode `N^a` window.
+///
+/// # Parameters
+/// - `rng`: Random number generator used for exponent sampling.
+///
+/// # Returns
+/// - `BigDecimal`: Random exponent `a` with `0.8 <= a <= 0.9`.
+///
+/// # Expected Output
+/// - Returns a normalized decimal exponent; no stdout/stderr output.
+fn sample_random_power_window_exponent(rng: &mut RngChoice) -> BigDecimal {
+    let span = RANDOM_POWER_WINDOW_MAX_UNITS - RANDOM_POWER_WINDOW_MIN_UNITS;
+    let units = RANDOM_POWER_WINDOW_MIN_UNITS + (rng.next_u64() % (span + 1));
+    (BigDecimal::from(units) / BigDecimal::from(RANDOM_POWER_WINDOW_SCALE_UNITS)).normalized()
+}
+
+/// Computes the factoring-mode upper bound used to sample a candidate `r`.
+///
+/// # Parameters
+/// - `n`: RSA modulus used as the size reference.
+/// - `scale`: Legacy additive scale used by the default sampler.
+/// - `attempt_index`: Zero-based generation attempt index.
+/// - `settings`: Candidate generation configuration.
+/// - `rng`: Random number generator used for exponent sampling.
+///
+/// # Returns
+/// - `BigUint`: Positive upper bound used for candidate sampling.
+///
+/// # Expected Output
+/// - Returns a positive upper bound; no stdout/stderr output.
+fn factoring_candidate_upper_bound(
+    n: &BigUint,
+    scale: &BigUint,
+    attempt_index: usize,
+    settings: &RCandidateSettings,
+    rng: &mut RngChoice,
+) -> BigUint {
+    if settings.random_power_window {
+        let exponent = sample_random_power_window_exponent(rng);
+        let upper = floor_biguint_pow_bigdecimal(n, &exponent);
+        if upper.is_zero() {
+            BigUint::one()
+        } else {
+            upper
+        }
+    } else {
+        n + scale + BigUint::from((attempt_index as u64) + 1)
+    }
+}
+
+/// Samples a retarget total exponent between the configured lower and upper limits.
+///
+/// # Parameters
+/// - `minimum_target_exponent`: Configured lower bound for the sampled total exponent.
+/// - `maximum_target_exponent`: Configured upper bound for the sampled total exponent.
+/// - `rng`: Random number generator used for exponent sampling.
+///
+/// # Returns
+/// - `BigDecimal`: Sampled total exponent for retargeting.
+///
+/// # Expected Output
+/// - Returns the normalized upper bound when the configured range is invalid; no stdout/stderr output.
+fn sample_retarget_total_exponent(
+    minimum_target_exponent: &BigDecimal,
+    maximum_target_exponent: &BigDecimal,
+    rng: &mut RngChoice,
+) -> BigDecimal {
+    let Some(lower_f64) = minimum_target_exponent.to_f64() else {
+        return maximum_target_exponent.normalized();
+    };
+    let Some(upper_f64) = maximum_target_exponent.to_f64() else {
+        return maximum_target_exponent.normalized();
+    };
+    let lower_units = (lower_f64 * RETARGET_EXPONENT_SCALE_UNITS as f64).floor() as u64;
+    let upper_units = (upper_f64 * RETARGET_EXPONENT_SCALE_UNITS as f64).floor() as u64;
+    if upper_units <= lower_units {
+        return maximum_target_exponent.normalized();
+    }
+
+    let units = lower_units + (rng.next_u64() % (upper_units - lower_units + 1));
+    (BigDecimal::from(units) / BigDecimal::from(RETARGET_EXPONENT_SCALE_UNITS)).normalized()
+}
+
+/// Samples one retargeted candidate update from the configured exponent window.
+///
+/// # Parameters
+/// - `n`: RSA modulus used as the base for retargeted `N^a` prime generation.
+/// - `minimum_target_exponent`: Lower bound for the sampled total exponent.
+/// - `target_exponent`: Upper bound for the sampled total exponent.
+/// - `partition_count`: Maximum number of exponent partitions to sample.
+/// - `minimum_component_exponent`: Minimum exponent allowed per partition.
+/// - `rng`: Random number generator used for exponent and partition sampling.
+///
+/// # Returns
+/// - `Option<(BigUint, Vec<(BigUint, u64)>, BigDecimal)>`: The sampled `r`, its factors, and the sampled target exponent.
+///
+/// # Expected Output
+/// - Returns `None` when no feasible partition exists; no stdout/stderr output.
+fn sample_retarget_candidate_update(
+    n: &BigUint,
+    minimum_target_exponent: &BigDecimal,
+    target_exponent: &BigDecimal,
+    partition_count: usize,
+    minimum_component_exponent: &BigDecimal,
+    rng: &mut RngChoice,
+) -> Option<(BigUint, Vec<(BigUint, u64)>, BigDecimal)> {
+    let sampled_target_exponent =
+        sample_retarget_total_exponent(minimum_target_exponent, target_exponent, rng);
+    let parts = random_bigdecimal_partition_with_min(
+        &sampled_target_exponent,
+        partition_count,
+        minimum_component_exponent,
+        rng,
+    );
+    if parts.is_empty() {
+        return None;
+    }
+
+    let mut factors = Vec::with_capacity(parts.len());
+    for part in parts {
+        let prime = next_prime_from_biguint_pow_bigdecimal(n, &part);
+        factors.push((prime, 1));
+    }
+    let factors = coalesce_factors(factors);
+    let r = factors
+        .iter()
+        .fold(BigUint::one(), |acc, (p, e)| acc * p.pow(*e as u32));
+
+    Some((r, factors, sampled_target_exponent))
+}
+
+/// Advances a probable prime upward to the next probable prime.
+///
+/// # Parameters
+/// - `prime`: Starting value to advance beyond.
+///
+/// # Returns
+/// - `BigUint`: The first probable prime strictly greater than `prime`.
+///
+/// # Expected Output
+/// - Returns a probable prime; no stdout/stderr output.
+fn next_probable_prime_after(prime: &BigUint) -> BigUint {
+    let mut candidate = prime + BigUint::one();
+    if candidate <= BigUint::from(2u8) {
+        return BigUint::from(2u8);
+    }
+    if candidate.is_even() {
+        candidate += BigUint::one();
+    }
+    while !is_probable_prime_big(&candidate) {
+        candidate += BigUint::from(2u8);
+    }
+    candidate
+}
+
+/// Advances the last prime factor of a retargeted candidate to the next probable prime.
+///
+/// # Parameters
+/// - `factors`: Prime factors associated with the current retargeted candidate.
+///
+/// # Returns
+/// - `(BigUint, Vec<(BigUint, u64)>)`: Next candidate modulus plus its normalized factors.
+///
+/// # Expected Output
+/// - Returns the next candidate in the uniqueness-repair sequence; no stdout/stderr output.
+fn advance_retarget_candidate_once(
+    mut factors: Vec<(BigUint, u64)>,
+) -> (BigUint, Vec<(BigUint, u64)>) {
+    debug_assert!(
+        !factors.is_empty(),
+        "retarget uniqueness repair requires factors"
+    );
+    let last_idx = factors.len() - 1;
+    factors[last_idx].0 = next_probable_prime_after(&factors[last_idx].0);
+    let normalized = coalesce_factors(factors);
+    let r = normalized
+        .iter()
+        .fold(BigUint::one(), |acc, (p, e)| acc * p.pow(*e as u32));
+    (r, normalized)
+}
+
+/// Resolves duplicate initial retarget updates in batches before the final global uniqueness sweep.
+///
+/// # Parameters
+/// - `updates`: Retargeted updates produced from random exponent sampling.
+///
+/// # Returns
+/// - `()`: This function returns nothing.
+///
+/// # Expected Output
+/// - Rewrites duplicate initial `r` values in place without using a shared global lock; no stdout/stderr output.
+fn uniquify_duplicate_retarget_updates_by_initial_r(
+    updates: &mut [Option<(BigUint, Vec<(BigUint, u64)>, BigDecimal)>],
+) {
+    let mut grouped_duplicates = BTreeMap::<BigUint, Vec<usize>>::new();
+    for (index, update) in updates.iter().enumerate() {
+        if let Some((r, _, _)) = update {
+            grouped_duplicates.entry(r.clone()).or_default().push(index);
+        }
+    }
+
+    let duplicate_groups = grouped_duplicates
+        .into_values()
+        .filter(|indices| indices.len() > 1)
+        .collect::<Vec<_>>();
+    let replacements = duplicate_groups
+        .into_par_iter()
+        .map(|indices| {
+            let mut current_factors = indices
+                .first()
+                .and_then(|&index| updates.get(index))
+                .and_then(|update| update.as_ref())
+                .map(|(_, factors, _)| factors.clone())
+                .unwrap_or_default();
+            if current_factors.is_empty() {
+                return Vec::new();
+            }
+
+            let mut group_replacements = Vec::with_capacity(indices.len().saturating_sub(1));
+            for &index in indices.iter().skip(1) {
+                let (next_r, next_factors) = advance_retarget_candidate_once(current_factors);
+                current_factors = next_factors.clone();
+                group_replacements.push((index, next_r, next_factors));
+            }
+            group_replacements
+        })
+        .collect::<Vec<_>>();
+
+    for group_replacements in replacements {
+        for (index, next_r, next_factors) in group_replacements {
+            if let Some(Some((r, factors, _))) = updates.get_mut(index) {
+                *r = next_r;
+                *factors = next_factors;
+            }
+        }
+    }
+}
+
+/// Finalizes retarget updates into globally unique `r` values while preserving prior batch rewrites.
+///
+/// # Parameters
+/// - `updates`: Retargeted updates to uniquify in their final output order.
+///
+/// # Returns
+/// - `()`: This function returns nothing.
+///
+/// # Expected Output
+/// - Performs a final uniqueness sweep and rewrites any remaining collisions in place; no stdout/stderr output.
+fn finalize_unique_retarget_updates(
+    updates: &mut [Option<(BigUint, Vec<(BigUint, u64)>, BigDecimal)>],
+) {
+    let mut seen = HashSet::with_capacity(updates.len());
+    for update in updates.iter_mut() {
+        let Some((r, factors, _)) = update.as_mut() else {
+            continue;
+        };
+        if factors.is_empty() {
+            seen.insert(r.clone());
+            continue;
+        }
+
+        while !seen.insert(r.clone()) {
+            let (next_r, next_factors) = advance_retarget_candidate_once(std::mem::take(factors));
+            *r = next_r;
+            *factors = next_factors;
+        }
+    }
+}
+
+/// Builds `r` candidates by sampling composites and factoring them.
+///
+/// # Parameters
+/// - `n`: RSA modulus used to scale candidate selection.
+/// - `settings`: Candidate generation configuration, including factor limits and overrides.
+/// - `rng`: Random number generator for candidate sampling.
+///
+/// # Returns
+/// - `Vec<RCandidate>`: List of mutable candidate records.
+///
+/// # Expected Output
+/// - Returns a list of candidates meeting factor constraints; may print progress logs.
+pub fn generate_r_candidates_via_factoring(
+    n: &BigUint,
+    settings: &RCandidateSettings,
+    rng: &mut RngChoice,
+) -> Vec<RCandidate> {
+    if let Some(ref override_r) = settings.override_best_r {
+        if !override_r.is_zero() {
+            if is_probable_prime_big(override_r) {
+                return Vec::new();
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            if let Some(factors) = factor_composite_with_timeout(override_r, rng, deadline) {
+                if factors.len() >= 3
+                    && factors
+                        .iter()
+                        .all(|(p, _)| p >= &settings.process_min_factor)
+                {
+                    return vec![RCandidate::new(override_r.clone(), factors)];
+                }
+            }
+        }
+    }
+
+    let min_factor = settings.process_min_factor.clone();
+    let scale = BigUint::one() << settings.process_scale;
+    let count = settings
+        .process_count
+        .max(settings.process_min_count)
+        .max(1);
+    let target_count = count as usize;
+
+    let mut collected: Vec<RCandidate> = Vec::new();
+    let mut seen: HashSet<BigUint> = HashSet::new();
+    let reserved = Arc::new(Mutex::new(HashSet::<BigUint>::new()));
+    if settings.random_power_window {
+        println!(
+            "Factoring-mode r candidates will sample from a random N^a window with a in [0.8, 0.9]"
+        );
+    }
+
+    let found = Arc::new(AtomicUsize::new(collected.len()));
+
+    let max_attempts = count.saturating_mul(1000);
+    let mut seeds = Vec::with_capacity(max_attempts as usize);
+    for _ in 0..max_attempts {
+        seeds.push(rng.next_u64());
+    }
+
+    println!("Generating r candidates... {} attempts", seeds.len());
+    let generation_started_at = Instant::now();
+    let attempts_done = Arc::new(AtomicU64::new(0));
+    let next_progress_log_at_ms = Arc::new(AtomicU64::new(
+        Duration::from_secs(5).as_millis().min(u128::from(u64::MAX)) as u64,
+    ));
+    let total_attempts = u64::try_from(seeds.len()).unwrap_or(u64::MAX);
+    let target_generation_count = u64::try_from(target_count).unwrap_or(u64::MAX);
+
+    let generated = seeds
+        .into_par_iter()
+        .enumerate()
+        .filter_map(|(idx, seed)| {
+            if found.load(Ordering::Relaxed) >= target_count {
+                return None;
+            }
+
+            let result = (|| {
+                let mut local_rng = RngChoice::from_seed(rng.mode(), seed);
+                let upper =
+                    factoring_candidate_upper_bound(n, &scale, idx, settings, &mut local_rng);
+                let candidate = random_biguint_below(&upper, &mut local_rng) + BigUint::one();
+                let candidate_key = candidate.clone();
+                let Ok(mut reserved_guard) = reserved.lock() else {
+                    return None;
+                };
+                if !reserved_guard.insert(candidate_key) {
+                    return None;
+                }
+                drop(reserved_guard);
+                if is_probable_prime_big(&candidate) {
+                    println!("Skipping prime r candidate: {}", candidate);
+                    return None;
+                }
+                let deadline = Instant::now() + Duration::from_millis(5000);
+                let Some(factors) =
+                    factor_composite_with_timeout(&candidate, &mut local_rng, deadline)
+                else {
+                    return None;
+                };
+                if factors.len() < 3 {
+                    return None;
+                }
+                if factors.iter().any(|(p, _)| p < &min_factor) {
+                    return None;
+                }
+
+                let prev = found.fetch_add(1, Ordering::Relaxed);
+                if prev >= target_count {
+                    return None;
+                }
+
+                println!(
+                    "Generated r candidate: {}, factors {:?}",
+                    candidate, factors
+                );
+                Some(RCandidate::new(candidate, factors))
+            })();
+            let attempts_count = attempts_done.fetch_add(1, Ordering::Relaxed) + 1;
+            let accepted_count =
+                u64::try_from(found.load(Ordering::Relaxed).min(target_count)).unwrap_or(u64::MAX);
+            log_generation_status_every_interval(
+                attempts_count,
+                total_attempts,
+                accepted_count,
+                target_generation_count,
+                &generation_started_at,
+                &next_progress_log_at_ms,
+                "Factoring r candidate generation",
+                Duration::from_secs(5),
+            );
+            result
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "Factoring r candidate generation progress: accepted {}/{} attempts {}/{} elapsed {:.1}s",
+        found.load(Ordering::Relaxed).min(target_count),
+        target_count,
+        attempts_done.load(Ordering::Relaxed),
+        total_attempts,
+        generation_started_at.elapsed().as_secs_f64(),
+    );
+
+    let mut new_candidates = Vec::new();
+    for candidate in generated {
+        if seen.insert(candidate.r.clone()) {
+            new_candidates.push(candidate);
+        }
+    }
+
+    collected.extend(new_candidates.iter().cloned());
+    collected.truncate(target_count);
+
+    collected
+}
+
+/// Loads previously generated `r` candidates from a CSV file.
+///
+#[derive(Debug)]
+struct LoadedCandidateFile {
+    metadata: BTreeMap<String, String>,
+    entries: Vec<RCandidate>,
+}
+
+/// Loads reusable r candidates from a CSV file.
+///
+/// Parses a candidate CSV file and returns both metadata and candidate entries.
+///
+/// # Parameters
+/// - `path`: Path to the candidate CSV file.
+///
+/// # Returns
+/// - `Result<LoadedCandidateFile, Box<dyn Error>>`: Parsed metadata and entries.
+///
+/// # Expected Output
+/// - Reads the file and may print row-level parse errors before returning.
+fn load_candidate_file(path: &str) -> Result<LoadedCandidateFile, Box<dyn Error>> {
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(err) => {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                println!("Failed to open candidate file {}: {}", path, err);
+            }
+            return Ok(LoadedCandidateFile {
+                metadata: BTreeMap::new(),
+                entries: Vec::new(),
+            });
+        }
+    };
+
+    let reader = BufReader::new(file);
+    let mut metadata = BTreeMap::new();
+    let mut entries = Vec::new();
+
+    for (idx, line) in reader.lines().enumerate() {
+        let line = match line {
+            Ok(l) => l,
+            Err(err) => {
+                println!(
+                    "Skipping line {} in candidate file due to read error: {}",
+                    idx + 1,
+                    err
+                );
+                continue;
+            }
+        };
+
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(comment) = line.strip_prefix('#') {
+            if let Some((key, value)) = comment.trim().split_once('=') {
+                metadata.insert(key.trim().to_string(), value.trim().to_string());
+            }
+            continue;
+        }
+
+        let mut parts = line.splitn(3, ',');
+        let r_str = parts.next().unwrap_or("").trim();
+        let second = parts.next().unwrap_or("").trim();
+        let third = parts.next().unwrap_or("").trim();
+        let (target_exponent_str, factors_str) = if third.is_empty() {
+            ("0", second)
+        } else {
+            (second, third)
+        };
+
+        if r_str.is_empty() || factors_str.is_empty() {
+            println!(
+                "Skipping line {} in candidate file: missing r or factors entry",
+                idx + 1
+            );
+            continue;
+        }
+
+        let r = match r_str.parse::<BigUint>() {
+            Ok(val) => val,
+            Err(err) => {
+                println!(
+                    "Skipping line {} in candidate file: invalid r '{}': {}",
+                    idx + 1,
+                    r_str,
+                    err
+                );
+                continue;
+            }
+        };
+
+        let target_exponent = match target_exponent_str.parse::<BigDecimal>() {
+            Ok(exponent) => exponent,
+            Err(err) => {
+                println!(
+                    "Skipping line {} in candidate file: invalid target exponent '{}': {}",
+                    idx + 1,
+                    target_exponent_str,
+                    err
+                );
+                continue;
+            }
+        };
+
+        let Some(factors) = parse_factors_csv(factors_str) else {
+            println!(
+                "Skipping line {} in candidate file: invalid factors '{}': expected p^e;...",
+                idx + 1,
+                factors_str
+            );
+            continue;
+        };
+
+        entries.push(RCandidate {
+            r,
+            factors,
+            target_exponent,
+        });
+    }
+
+    Ok(LoadedCandidateFile { metadata, entries })
+}
+
+/// Retargets candidates using random decimal exponent partitions.
+///
+/// # Parameters
+/// - `n`: Original RSA modulus used as the base for `N^a`, `N^b`, and `N^c`.
+/// - `candidates`: Mutable candidate list to rewrite in place.
+/// - `minimum_target_exponent`: Configured lower bound for the sampled total exponent budget.
+/// - `target_exponent`: Configured upper bound for the sampled total exponent budget.
+/// - `partition_count`: Maximum number of exponent partitions to generate per candidate.
+/// - `minimum_component_exponent`: Minimum exponent allowed for each retargeted partition.
+/// - `rng`: Random number generator used for the exponent partitioning.
+///
+/// # Returns
+/// - `()`: This function returns nothing.
+///
+/// # Expected Output
+/// - Rewrites each candidate's modulus and factors in place and may print periodic progress logs.
+pub fn retarget_r_candidates_for_speculative_oracles(
+    n: &BigUint,
+    candidates: &mut [RCandidate],
+    minimum_target_exponent: &BigDecimal,
+    target_exponent: &BigDecimal,
+    partition_count: usize,
+    minimum_component_exponent: &BigDecimal,
+    rng: &mut RngChoice,
+) {
+    if candidates.is_empty() || partition_count == 0 {
+        return;
+    }
+
+    println!(
+        "Retargeting {} r candidates for speculative oracles",
+        candidates.len()
+    );
+
+    let rng_mode = rng.mode();
+    let total_candidates = candidates.len();
+    let candidate_seeds: Vec<u64> = (0..candidates.len()).map(|_| rng.next_u64()).collect();
+    let started_at = Instant::now();
+    let completed = Arc::new(AtomicUsize::new(0));
+    let next_progress_log_secs = Arc::new(AtomicU64::new(5));
+    let progress_completed = Arc::clone(&completed);
+    let progress_next_log_secs = Arc::clone(&next_progress_log_secs);
+    let updates: Vec<Option<(BigUint, Vec<(BigUint, u64)>, BigDecimal)>> = candidate_seeds
+        .into_par_iter()
+        .map(|seed| {
+            let mut local_rng = RngChoice::from_seed(rng_mode, seed);
+            let update = sample_retarget_candidate_update(
+                n,
+                minimum_target_exponent,
+                target_exponent,
+                partition_count,
+                minimum_component_exponent,
+                &mut local_rng,
+            );
+            let completed_count = progress_completed.fetch_add(1, Ordering::Relaxed) + 1;
+            let elapsed_secs = started_at.elapsed().as_secs();
+            loop {
+                let next_log_secs = progress_next_log_secs.load(Ordering::Relaxed);
+                if elapsed_secs < next_log_secs {
+                    break;
+                }
+                if progress_next_log_secs
+                    .compare_exchange(
+                        next_log_secs,
+                        next_log_secs + 5,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    let percent = (completed_count as f64 / total_candidates as f64) * 100.0;
+                    println!(
+                        "Retargeting progress: {:.2}% ({}/{}) elapsed {:.1}s",
+                        percent,
+                        completed_count,
+                        total_candidates,
+                        started_at.elapsed().as_secs_f64(),
+                    );
+                    break;
+                }
+            }
+            update
+        })
+        .collect();
+
+    println!(
+        "Retargeting progress: 100.00% ({}/{}) elapsed {:.1}s",
+        total_candidates,
+        total_candidates,
+        started_at.elapsed().as_secs_f64(),
+    );
+
+    let mut updates = updates;
+    let uniquify_started_at = Instant::now();
+    uniquify_duplicate_retarget_updates_by_initial_r(&mut updates);
+    finalize_unique_retarget_updates(&mut updates);
+    let mut completed_count = 0usize;
+    let mut next_uniquify_log_secs = 5u64;
+    for (candidate, update) in candidates.iter_mut().zip(updates.into_iter()) {
+        if let Some((r, factors, sampled_target_exponent)) = update {
+            candidate.r = r;
+            candidate.factors = factors;
+            candidate.target_exponent = sampled_target_exponent;
+        }
+
+        completed_count += 1;
+        let elapsed_secs = uniquify_started_at.elapsed().as_secs();
+        while completed_count != total_candidates && elapsed_secs >= next_uniquify_log_secs {
+            let percent = (completed_count as f64 / total_candidates as f64) * 100.0;
+            println!(
+                "Retarget uniqueness progress: {:.2}% ({}/{}) elapsed {:.1}s",
+                percent,
+                completed_count,
+                total_candidates,
+                uniquify_started_at.elapsed().as_secs_f64(),
+            );
+            next_uniquify_log_secs += 5;
+        }
+    }
+    println!(
+        "Retarget uniqueness progress: 100.00% ({}/{}) elapsed {:.1}s",
+        completed_count,
+        total_candidates,
+        uniquify_started_at.elapsed().as_secs_f64(),
+    );
+}
+
+/// Parses a `p^e;...` factor list from CSV form.
+///
+/// # Parameters
+/// - `raw`: Raw CSV factors string (e.g., `"3^1;5^2"`).
+///
+/// # Returns
+/// - `Option<Vec<(BigUint, u64)>>`: Parsed factor list or `None` if invalid.
+///
+/// # Expected Output
+/// - Returns `None` on parse errors or empty input; no side effects.
+fn parse_factors_csv(raw: &str) -> Option<Vec<(BigUint, u64)>> {
+    let mut factors = Vec::new();
+
+    for entry in raw.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        let mut parts = entry.split('^');
+        let p_str = parts.next()?;
+        let e_str = parts.next().unwrap_or("1");
+
+        let p = p_str.parse::<BigUint>().ok()?;
+        let e = e_str.parse::<u64>().ok()?;
+        factors.push((p, e));
+    }
+
+    if factors.is_empty() {
+        None
+    } else {
+        Some(factors)
+    }
+}
+
+/// Formats a factor list as `p^e;...` for CSV output.
+///
+/// # Parameters
+/// - `factors`: Factor list to format.
+///
+/// # Returns
+/// - `String`: CSV-friendly factor string (empty for no factors).
+///
+/// # Expected Output
+/// - Returns a formatted string; no side effects.
+fn format_factors_csv(factors: &[(BigUint, u64)]) -> String {
+    factors
+        .iter()
+        .map(|(p, e)| format!("{}^{}", p, e))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rng::{RngChoice, RngMode};
+    use rand::RngCore;
+    use std::path::PathBuf;
+
+    fn temp_path(name: &str) -> PathBuf {
+        let mut rng = RngChoice::from_entropy(RngMode::Crypto).expect("rng entropy");
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "rsademo_{}_{}_{}.csv",
+            name,
+            std::process::id(),
+            rng.next_u64()
+        ));
+        path
+    }
+
+    #[test]
+    fn test_parse_factors_csv_valid() {
+        let raw = "3^1;5^2";
+        let factors = parse_factors_csv(raw).expect("missing factors");
+        assert_eq!(factors.len(), 2);
+        assert_eq!(factors[0].0, BigUint::from(3u8));
+        assert_eq!(factors[0].1, 1);
+        assert_eq!(factors[1].0, BigUint::from(5u8));
+        assert_eq!(factors[1].1, 2);
+    }
+
+    #[test]
+    fn test_parse_factors_csv_invalid() {
+        let raw = "not_a_number";
+        assert!(parse_factors_csv(raw).is_none());
+    }
+
+    #[test]
+    fn test_format_factors_csv_basic() {
+        let factors = vec![(BigUint::from(3u8), 1), (BigUint::from(5u8), 2)];
+        let formatted = format_factors_csv(&factors);
+        assert_eq!(formatted, "3^1;5^2");
+    }
+
+    #[test]
+    fn test_format_factors_csv_empty() {
+        let formatted = format_factors_csv(&[]);
+        assert_eq!(formatted, "");
+    }
+
+    #[test]
+    fn test_load_candidate_file_missing_file() {
+        let missing = temp_path("missing");
+        let loaded = load_candidate_file(missing.to_str().unwrap()).expect("load should succeed");
+        assert!(loaded.entries.is_empty());
+    }
+
+    #[test]
+    fn test_load_candidate_file_parses() {
+        let path = temp_path("load");
+        let content = "# header\n105,3^1;5^1;7^1\n";
+        fs::write(&path, content).expect("write failed");
+        let loaded = load_candidate_file(path.to_str().unwrap()).expect("load should succeed");
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries[0].r, BigUint::from(105u8));
+        assert_eq!(loaded.entries[0].factors.len(), 3);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_candidate_file_parses_target_exponent_column() {
+        let path = temp_path("load_target_exponent");
+        let content = "# n=3233\n105,0.875,3^1;5^1;7^1\n";
+        fs::write(&path, content).expect("write failed");
+        let loaded = load_candidate_file(path.to_str().unwrap()).expect("load should succeed");
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(
+            loaded.entries[0].target_exponent,
+            BigDecimal::parse_bytes(b"0.875", 10).expect("valid exponent")
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_resolve_retargeted_r_candidates_path_uses_key_bits() {
+        assert_eq!(
+            resolve_retargeted_r_candidates_path("data/rgen_retargeted", 512),
+            "data/rgen_retargeted/512.csv"
+        );
+    }
+
+    #[test]
+    fn test_load_retargeted_r_candidates_rejects_mismatched_modulus() {
+        let path = temp_path("retargeted_mismatch");
+        let content = "# n=9999\n105,0.875,3^1;5^1;7^1\n";
+        fs::write(&path, content).expect("write failed");
+        let err = load_retargeted_r_candidates(path.to_str().unwrap(), &BigUint::from(3233u32))
+            .expect_err("cache should reject mismatched modulus");
+        assert!(err.to_string().contains("different modulus"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_retargeted_r_candidates_missing_file_is_cache_miss() {
+        let path = temp_path("retargeted_missing");
+        let loaded = load_retargeted_r_candidates(path.to_str().unwrap(), &BigUint::from(3233u32))
+            .expect("missing cache should be treated as empty");
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn test_prepare_r_candidates_batch_uses_retargeted_cache() {
+        let path = temp_path("retargeted_prepare");
+        let content = "# n=3233\n105,0.875,3^1;5^1;7^1\n";
+        fs::write(&path, content).expect("write failed");
+        let settings = RCandidateSettings {
+            mode: RCandidateMode::SmallPrimes,
+            override_best_r: None,
+            process_min_factor: BigUint::from(3u8),
+            process_count: 1,
+            process_min_count: 1,
+            process_scale: 8,
+            reuse_retargeted_r_candidates: true,
+            reuse_retargeted_r_candidates_path: path.to_string_lossy().to_string(),
+            small_primes: vec![3u8, 5u8, 7u8].into_iter().map(BigUint::from).collect(),
+            small_prime_factors_per_candidate: 3,
+            max_factors_per_candidate: 6,
+            target_bit_length: Some(16),
+            random_power_window: false,
+            target_exponent_minimum: BigDecimal::parse_bytes(b"0.8", 10).expect("valid exponent"),
+            target_exponent: BigDecimal::parse_bytes(b"0.9", 10).expect("valid exponent"),
+            retarget_partition_count: 3,
+            retarget_minimum_exponent: BigDecimal::parse_bytes(b"0.45", 10)
+                .expect("valid minimum exponent"),
+        };
+        let mut rng = RngChoice::from_seed(RngMode::Standard, 99);
+        let candidates =
+            prepare_r_candidates_batch(&BigUint::from(3233u32), &settings, &mut rng, 1)
+                .expect("prepare cache batch failed");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].target_exponent,
+            BigDecimal::parse_bytes(b"0.875", 10).expect("valid exponent")
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_prepare_r_candidates_batch_populates_retargeted_cache_when_missing() {
+        let cache_dir = temp_path("retargeted_cache_fill");
+        let _ = fs::remove_file(&cache_dir);
+        let path = cache_dir
+            .join("nested")
+            .join("rgen_retargeted")
+            .join("16.csv");
+        let settings = RCandidateSettings {
+            mode: RCandidateMode::SmallPrimes,
+            override_best_r: None,
+            process_min_factor: BigUint::from(3u8),
+            process_count: 10,
+            process_min_count: 10,
+            process_scale: 8,
+            reuse_retargeted_r_candidates: true,
+            reuse_retargeted_r_candidates_path: path.to_string_lossy().to_string(),
+            small_primes: vec![3u8, 5u8, 7u8, 11u8]
+                .into_iter()
+                .map(BigUint::from)
+                .collect(),
+            small_prime_factors_per_candidate: 3,
+            max_factors_per_candidate: 5,
+            target_bit_length: Some(16),
+            random_power_window: false,
+            target_exponent_minimum: BigDecimal::parse_bytes(b"0.8", 10).expect("valid exponent"),
+            target_exponent: BigDecimal::parse_bytes(b"0.9", 10).expect("valid exponent"),
+            retarget_partition_count: 3,
+            retarget_minimum_exponent: BigDecimal::parse_bytes(b"0.45", 10)
+                .expect("valid minimum exponent"),
+        };
+        let mut rng = RngChoice::from_seed(RngMode::Standard, 199);
+        let candidates =
+            prepare_r_candidates_batch(&BigUint::from(3233u32), &settings, &mut rng, 3)
+                .expect("prepare cache batch failed");
+        assert_eq!(candidates.len(), 3);
+        assert!(path.exists());
+        let cached = load_retargeted_r_candidates(path.to_str().unwrap(), &BigUint::from(3233u32))
+            .expect("cache should load after creation");
+        assert!(cached.len() >= 3);
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn test_generate_retargeted_r_candidates_batch_uses_fresh_seed() {
+        let settings = RCandidateSettings {
+            mode: RCandidateMode::SmallPrimes,
+            override_best_r: None,
+            process_min_factor: BigUint::from(3u8),
+            process_count: 10,
+            process_min_count: 10,
+            process_scale: 8,
+            reuse_retargeted_r_candidates: false,
+            reuse_retargeted_r_candidates_path: String::new(),
+            small_primes: vec![3u8, 5u8, 7u8, 11u8]
+                .into_iter()
+                .map(BigUint::from)
+                .collect(),
+            small_prime_factors_per_candidate: 3,
+            max_factors_per_candidate: 5,
+            target_bit_length: Some(16),
+            random_power_window: false,
+            target_exponent_minimum: BigDecimal::parse_bytes(b"0.8", 10).expect("valid exponent"),
+            target_exponent: BigDecimal::parse_bytes(b"0.9", 10).expect("valid exponent"),
+            retarget_partition_count: 3,
+            retarget_minimum_exponent: BigDecimal::parse_bytes(b"0.45", 10)
+                .expect("valid minimum exponent"),
+        };
+        let mut rng = RngChoice::from_seed(RngMode::Standard, 7);
+        let candidates =
+            generate_retargeted_r_candidates_batch(&BigUint::from(3233u32), &settings, &mut rng, 4)
+                .expect("retarget batch should generate");
+        assert_eq!(candidates.len(), 4);
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| !candidate.factors.is_empty())
+        );
+        assert!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.r.clone())
+                .collect::<HashSet<_>>()
+                .len()
+                >= 2
+        );
+    }
+
+    #[test]
+    fn test_generate_r_candidates_from_small_primes() {
+        let settings = RCandidateSettings {
+            mode: RCandidateMode::SmallPrimes,
+            override_best_r: None,
+            process_min_factor: BigUint::from(3u8),
+            process_count: 2,
+            process_min_count: 1,
+            process_scale: 8,
+            reuse_retargeted_r_candidates: false,
+            reuse_retargeted_r_candidates_path: "".to_string(),
+            small_primes: vec![3u8, 5u8, 7u8, 11u8]
+                .into_iter()
+                .map(BigUint::from)
+                .collect(),
+            small_prime_factors_per_candidate: 3,
+            max_factors_per_candidate: 5,
+            target_bit_length: Some(16),
+            random_power_window: false,
+            target_exponent_minimum: BigDecimal::parse_bytes(b"0.8", 10).expect("valid exponent"),
+            target_exponent: BigDecimal::parse_bytes(b"2.005", 10).expect("valid exponent"),
+            retarget_partition_count: 3,
+            retarget_minimum_exponent: BigDecimal::parse_bytes(b"0.45", 10)
+                .expect("valid minimum exponent"),
+        };
+        let mut rng = RngChoice::from_seed(RngMode::Standard, 42);
+        let candidates = generate_r_candidates_from_small_primes(&settings, &mut rng);
+        assert!(!candidates.is_empty());
+        let candidate = &candidates[0];
+        let product = candidate
+            .factors
+            .iter()
+            .fold(BigUint::one(), |acc, (p, e)| acc * p.pow(*e as u32));
+        assert_eq!(product, candidate.r);
+        assert!(candidate.factors.len() >= settings.small_prime_factors_per_candidate + 1);
+        let max_small = settings
+            .small_primes
+            .iter()
+            .max()
+            .cloned()
+            .unwrap_or_else(|| BigUint::from(2u8));
+        assert!(candidate.factors.iter().any(|(p, _)| p > &max_small));
+    }
+
+    #[test]
+    fn test_generate_r_candidates_from_small_primes_empty() {
+        let settings = RCandidateSettings {
+            mode: RCandidateMode::SmallPrimes,
+            override_best_r: None,
+            process_min_factor: BigUint::from(3u8),
+            process_count: 1,
+            process_min_count: 1,
+            process_scale: 8,
+            reuse_retargeted_r_candidates: false,
+            reuse_retargeted_r_candidates_path: "".to_string(),
+            small_primes: vec![3u8, 5u8].into_iter().map(BigUint::from).collect(),
+            small_prime_factors_per_candidate: 3,
+            max_factors_per_candidate: 4,
+            target_bit_length: Some(12),
+            random_power_window: false,
+            target_exponent_minimum: BigDecimal::parse_bytes(b"0.8", 10).expect("valid exponent"),
+            target_exponent: BigDecimal::parse_bytes(b"2.005", 10).expect("valid exponent"),
+            retarget_partition_count: 3,
+            retarget_minimum_exponent: BigDecimal::parse_bytes(b"0.45", 10)
+                .expect("valid minimum exponent"),
+        };
+        let mut rng = RngChoice::from_seed(RngMode::Standard, 43);
+        let candidates = generate_r_candidates_from_small_primes(&settings, &mut rng);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_generate_r_candidates_small_primes_mode() {
+        let settings = RCandidateSettings {
+            mode: RCandidateMode::SmallPrimes,
+            override_best_r: None,
+            process_min_factor: BigUint::from(3u8),
+            process_count: 1,
+            process_min_count: 1,
+            process_scale: 8,
+            reuse_retargeted_r_candidates: false,
+            reuse_retargeted_r_candidates_path: "".to_string(),
+            small_primes: vec![3u8, 5u8, 7u8].into_iter().map(BigUint::from).collect(),
+            small_prime_factors_per_candidate: 3,
+            max_factors_per_candidate: 4,
+            target_bit_length: Some(14),
+            random_power_window: false,
+            target_exponent_minimum: BigDecimal::parse_bytes(b"0.8", 10).expect("valid exponent"),
+            target_exponent: BigDecimal::parse_bytes(b"2.005", 10).expect("valid exponent"),
+            retarget_partition_count: 3,
+            retarget_minimum_exponent: BigDecimal::parse_bytes(b"0.45", 10)
+                .expect("valid minimum exponent"),
+        };
+        let mut rng = RngChoice::from_seed(RngMode::Standard, 44);
+        let candidates = generate_r_candidates(&BigUint::from(100u8), &settings, &mut rng);
+        assert!(!candidates.is_empty());
+    }
+
+    #[test]
+    fn test_generate_r_candidates_factoring_mode_dispatch() {
+        let settings = RCandidateSettings {
+            mode: RCandidateMode::Factoring,
+            override_best_r: Some(BigUint::from(105u8)),
+            process_min_factor: BigUint::from(3u8),
+            process_count: 1,
+            process_min_count: 1,
+            process_scale: 8,
+            reuse_retargeted_r_candidates: false,
+            reuse_retargeted_r_candidates_path: "".to_string(),
+            small_primes: Vec::new(),
+            small_prime_factors_per_candidate: 3,
+            max_factors_per_candidate: 6,
+            target_bit_length: None,
+            random_power_window: false,
+            target_exponent_minimum: BigDecimal::parse_bytes(b"0.8", 10).expect("valid exponent"),
+            target_exponent: BigDecimal::parse_bytes(b"2.005", 10).expect("valid exponent"),
+            retarget_partition_count: 3,
+            retarget_minimum_exponent: BigDecimal::parse_bytes(b"0.45", 10)
+                .expect("valid minimum exponent"),
+        };
+        let mut rng = RngChoice::from_seed(RngMode::Standard, 46);
+        let candidates = generate_r_candidates(&BigUint::from(100u8), &settings, &mut rng);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].r, BigUint::from(105u8));
+    }
+
+    #[test]
+    fn test_generate_r_candidates_override_factoring() {
+        let settings = RCandidateSettings {
+            mode: RCandidateMode::Factoring,
+            override_best_r: Some(BigUint::from(105u8)),
+            process_min_factor: BigUint::from(3u8),
+            process_count: 1,
+            process_min_count: 1,
+            process_scale: 8,
+            reuse_retargeted_r_candidates: false,
+            reuse_retargeted_r_candidates_path: "".to_string(),
+            small_primes: Vec::new(),
+            small_prime_factors_per_candidate: 3,
+            max_factors_per_candidate: 6,
+            target_bit_length: None,
+            random_power_window: false,
+            target_exponent_minimum: BigDecimal::parse_bytes(b"0.8", 10).expect("valid exponent"),
+            target_exponent: BigDecimal::parse_bytes(b"2.005", 10).expect("valid exponent"),
+            retarget_partition_count: 3,
+            retarget_minimum_exponent: BigDecimal::parse_bytes(b"0.45", 10)
+                .expect("valid minimum exponent"),
+        };
+        let mut rng = RngChoice::from_seed(RngMode::Standard, 45);
+        let candidates =
+            generate_r_candidates_via_factoring(&BigUint::from(100u8), &settings, &mut rng);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].r, BigUint::from(105u8));
+        assert!(candidates[0].factors.len() >= 3);
+    }
+
+    #[test]
+    fn test_generate_r_candidates_via_factoring_rejects_prime_override() {
+        let settings = RCandidateSettings {
+            mode: RCandidateMode::Factoring,
+            override_best_r: Some(BigUint::from(101u8)),
+            process_min_factor: BigUint::from(3u8),
+            process_count: 1,
+            process_min_count: 1,
+            process_scale: 8,
+            reuse_retargeted_r_candidates: false,
+            reuse_retargeted_r_candidates_path: "".to_string(),
+            small_primes: Vec::new(),
+            small_prime_factors_per_candidate: 3,
+            max_factors_per_candidate: 6,
+            target_bit_length: None,
+            random_power_window: false,
+            target_exponent_minimum: BigDecimal::parse_bytes(b"0.8", 10).expect("valid exponent"),
+            target_exponent: BigDecimal::parse_bytes(b"2.005", 10).expect("valid exponent"),
+            retarget_partition_count: 3,
+            retarget_minimum_exponent: BigDecimal::parse_bytes(b"0.45", 10)
+                .expect("valid minimum exponent"),
+        };
+        let mut rng = RngChoice::from_seed(RngMode::Standard, 47);
+        let candidates =
+            generate_r_candidates_via_factoring(&BigUint::from(100u8), &settings, &mut rng);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_ciphertext_stream_sequence() {
+        let n = BigUint::from(97u32);
+        let c = BigUint::from(5u32);
+        let candidates = generate_r_candidates_from_ciphertext_stream(&c, &n, 3, 1);
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(candidates[0].r, BigUint::from(5u32));
+        assert_eq!(candidates[1].r, BigUint::from(25u32));
+        assert_eq!(candidates[2].r, BigUint::from(28u32));
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.factors.is_empty())
+        );
+    }
+
+    #[test]
+    fn test_ciphertext_stream_exponent_increments() {
+        let n = BigUint::from(101u32);
+        let c = BigUint::from(3u32);
+        let mut exponent = 0u64;
+        let first = ciphertext_stream_next(&c, &n, &mut exponent);
+        let second = ciphertext_stream_next(&c, &n, &mut exponent);
+        assert_eq!(exponent, 2);
+        assert_eq!(first, BigUint::one());
+        assert_eq!(second, BigUint::from(3u32));
+    }
+
+    #[test]
+    fn test_ciphertext_stream_empty_on_zero_modulus() {
+        let n = BigUint::zero();
+        let c = BigUint::from(7u32);
+        let candidates = generate_r_candidates_from_ciphertext_stream(&c, &n, 2, 0);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_sample_random_power_window_exponent_stays_in_range() {
+        let mut rng = RngChoice::from_seed(RngMode::Standard, 49);
+        let minimum = BigDecimal::parse_bytes(b"0.8", 10).expect("valid minimum");
+        let maximum = BigDecimal::parse_bytes(b"0.9", 10).expect("valid maximum");
+
+        for _ in 0..64 {
+            let exponent = sample_random_power_window_exponent(&mut rng);
+            assert!(exponent >= minimum);
+            assert!(exponent <= maximum);
+        }
+    }
+
+    #[test]
+    fn test_factoring_candidate_upper_bound_uses_power_window_when_enabled() {
+        let settings = RCandidateSettings {
+            mode: RCandidateMode::Factoring,
+            override_best_r: None,
+            process_min_factor: BigUint::from(3u8),
+            process_count: 1,
+            process_min_count: 1,
+            process_scale: 8,
+            reuse_retargeted_r_candidates: false,
+            reuse_retargeted_r_candidates_path: "".to_string(),
+            small_primes: Vec::new(),
+            small_prime_factors_per_candidate: 3,
+            max_factors_per_candidate: 6,
+            target_bit_length: None,
+            random_power_window: true,
+            target_exponent_minimum: BigDecimal::parse_bytes(b"0.8", 10).expect("valid exponent"),
+            target_exponent: BigDecimal::parse_bytes(b"2.005", 10).expect("valid exponent"),
+            retarget_partition_count: 3,
+            retarget_minimum_exponent: BigDecimal::parse_bytes(b"0.45", 10)
+                .expect("valid minimum exponent"),
+        };
+        let n = BigUint::from(1_000_000u64);
+        let minimum = floor_biguint_pow_bigdecimal(
+            &n,
+            &BigDecimal::parse_bytes(b"0.8", 10).expect("valid minimum"),
+        );
+        let maximum = floor_biguint_pow_bigdecimal(
+            &n,
+            &BigDecimal::parse_bytes(b"0.9", 10).expect("valid maximum"),
+        );
+        let mut rng = RngChoice::from_seed(RngMode::Standard, 50);
+
+        let upper =
+            factoring_candidate_upper_bound(&n, &BigUint::from(256u16), 0, &settings, &mut rng);
+
+        assert!(upper >= minimum);
+        assert!(upper <= maximum);
+    }
+
+    #[test]
+    fn test_sample_retarget_total_exponent_stays_in_range() {
+        let mut rng = RngChoice::from_seed(RngMode::Standard, 51);
+        let upper = BigDecimal::parse_bytes(b"0.9", 10).expect("valid upper");
+        let lower = BigDecimal::parse_bytes(b"0.8", 10).expect("valid lower");
+
+        for _ in 0..64 {
+            let sampled = sample_retarget_total_exponent(&lower, &upper, &mut rng);
+            assert!(sampled >= lower);
+            assert!(sampled <= upper);
+        }
+    }
+
+    #[test]
+    fn test_retarget_r_candidates_for_speculative_oracles() {
+        let mut candidates = vec![RCandidate::new(BigUint::from(21u8), vec![])];
+        let mut rng = RngChoice::from_seed(RngMode::Standard, 48);
+        retarget_r_candidates_for_speculative_oracles(
+            &BigUint::from(1000u16),
+            &mut candidates,
+            &BigDecimal::parse_bytes(b"0.8", 10).expect("valid lower exponent"),
+            &BigDecimal::parse_bytes(b"0.9", 10).expect("valid exponent"),
+            3,
+            &BigDecimal::parse_bytes(b"0.45", 10).expect("valid minimum exponent"),
+            &mut rng,
+        );
+
+        let lower = BigDecimal::parse_bytes(b"0.8", 10).expect("valid lower");
+        let upper = BigDecimal::parse_bytes(b"0.9", 10).expect("valid upper");
+        assert!(candidates[0].target_exponent >= lower);
+        assert!(candidates[0].target_exponent <= upper);
+        let product = candidates[0]
+            .factors
+            .iter()
+            .fold(BigUint::one(), |acc, (p, e)| acc * p.pow(*e as u32));
+        assert_eq!(product, candidates[0].r);
+        assert!(!candidates[0].factors.is_empty());
+        assert!(candidates[0].factors.len() <= 3);
+        assert!(
+            candidates[0]
+                .factors
+                .iter()
+                .all(|(p, _)| is_probable_prime_big(p))
+        );
+    }
+
+    #[test]
+    fn test_retarget_r_candidates_for_speculative_oracles_enforces_unique_r_values() {
+        let mut candidates = (0..16)
+            .map(|idx| RCandidate::new(BigUint::from(idx + 21usize), vec![]))
+            .collect::<Vec<_>>();
+        let mut rng = RngChoice::from_seed(RngMode::Standard, 52);
+        retarget_r_candidates_for_speculative_oracles(
+            &BigUint::from(10u8).pow(12),
+            &mut candidates,
+            &BigDecimal::parse_bytes(b"0.8", 10).expect("valid lower exponent"),
+            &BigDecimal::parse_bytes(b"0.87", 10).expect("valid exponent"),
+            2,
+            &BigDecimal::parse_bytes(b"0.45", 10).expect("valid minimum exponent"),
+            &mut rng,
+        );
+
+        let unique_r_count = candidates
+            .iter()
+            .map(|candidate| candidate.r.to_string())
+            .collect::<HashSet<_>>()
+            .len();
+        assert_eq!(unique_r_count, candidates.len());
+        for candidate in candidates {
+            let product = candidate
+                .factors
+                .iter()
+                .fold(BigUint::one(), |acc, (p, e)| acc * p.pow(*e as u32));
+            assert_eq!(product, candidate.r);
+        }
+    }
+}
