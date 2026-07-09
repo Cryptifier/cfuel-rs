@@ -558,7 +558,7 @@ pub fn load_config(path: &str) -> Result<Config, Box<dyn Error>> {
     }
 
     let raw = fs::read_to_string(cfg_path)?;
-    let mut config: Config = serde_json::from_str(&raw)
+    let mut config: Config = json5::from_str(&raw)
         .map_err(|err| format!("failed to parse config file {path}: {err}"))?;
 
     config.source_path = Some(cfg_path.to_path_buf());
@@ -2055,4 +2055,55 @@ fn default_combiner_k_oracles() -> usize {
 /// - Returns a constant default value; no side effects.
 fn default_combiner_tie_breaker() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn temp_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("unix time")
+            .as_nanos();
+        path.push(format!(
+            "cfuel_config_{name}_{}_{}.json",
+            std::process::id(),
+            unique
+        ));
+        path
+    }
+
+    #[test]
+    fn load_config_accepts_json5_comments_and_trailing_commas() {
+        let path = temp_path("json5");
+        let raw = r#"
+        {
+          // Comments are valid JSON5 but not strict JSON.
+          "rsa_keypair": {
+            "generate": false,
+            "e": 65537,
+            "keyfile": "",
+            "private_keyfile": "",
+            "p": 61,
+            "q": 53,
+          },
+        }
+        "#;
+        fs::write(&path, raw).expect("write temp config");
+
+        let config = load_config(path.to_str().expect("utf8 path")).expect("parse config");
+        assert_eq!(config.rsa_keypair.e, 65_537);
+        assert_eq!(config.rsa_keypair.p, Some(BigUint::from(61u8)));
+        assert_eq!(config.rsa_keypair.q, Some(BigUint::from(53u8)));
+        assert_eq!(config.source_path.as_deref(), Some(path.as_path()));
+
+        let _ = fs::remove_file(path);
+    }
 }
