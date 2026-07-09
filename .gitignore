@@ -1,4 +1,6 @@
 /target
+.cargo-home/
+rsa*/
 
 
 # Added by cargo

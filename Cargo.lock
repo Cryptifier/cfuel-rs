@@ -131,6 +131,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "cfuel"
+version = "0.1.0"
+dependencies = [
+ "bigdecimal",
+ "diesel",
+ "hex",
+ "insta",
+ "linfa",
+ "linfa-clustering",
+ "linfa-reduction",
+ "ndarray",
+ "num-bigint",
+ "num-integer",
+ "num-rational",
+ "num-traits",
+ "plotters",
+ "r2d2",
+ "rand",
+ "rand_chacha",
+ "rayon",
+ "serde",
+ "serde_json",
+ "zmq",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -571,32 +597,6 @@ dependencies = [
  "cc",
  "libc",
  "pkg-config",
-]
-
-[[package]]
-name = "fuel"
-version = "0.1.0"
-dependencies = [
- "bigdecimal",
- "diesel",
- "hex",
- "insta",
- "linfa",
- "linfa-clustering",
- "linfa-reduction",
- "ndarray",
- "num-bigint",
- "num-integer",
- "num-rational",
- "num-traits",
- "plotters",
- "r2d2",
- "rand",
- "rand_chacha",
- "rayon",
- "serde",
- "serde_json",
- "zmq",
 ]
 
 [[package]]
