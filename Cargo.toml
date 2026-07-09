@@ -2,6 +2,13 @@
 name = "cfuel"
 version = "0.1.0"
 edition = "2024"
+license = "EPL-2.0"
+authors = ["Nicholas LaRoche <nlaroche@cryptifier.dev>"]
+description = "Toolkit for RSA avalanche analysis, candidate scoring, and search."
+repository = "https://github.com/Cryptifier/cfuel-rs"
+readme = "README.md"
+keywords = ["rsa", "cryptography", "avalanche", "analysis"]
+categories = ["cryptography", "mathematics"]
 
 [dependencies]
 bigdecimal = { version = "0.4", features = ["serde"] }
