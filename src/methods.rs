@@ -53,7 +53,10 @@ use crate::avalanche::{
     sort_candidates_by_hamming_distance,
 };
 use crate::combiner::majority_vote_with_distribution;
-use crate::config::{AvalancheTotientMode, Config, EngineConfig, resolve_config_relative_path};
+use crate::config::{
+    AvalancheTotientMode, Config, EngineConfig, RsaKeyFileFormat,
+    load_rsa_key_material_from_config_keyfile, resolve_config_relative_path,
+};
 use crate::database::{
     AvalancheCacheGuard, approximate_scored_avalanche_input_bytes,
     build_cached_avalanche_tier_statistics, count_cached_scored_inputs,
@@ -176,6 +179,9 @@ enum RoundtripVerification {
         q: BigUint,
         totient: BigUint,
         totient_mode: AvalancheTotientMode,
+        d: BigUint,
+    },
+    Peek {
         d: BigUint,
     },
 }
@@ -394,10 +400,11 @@ fn resolve_message_input(
                 );
             }
             let decrypted_message = match verification {
-                Some(RoundtripVerification::Full { d, .. }) => ciphertext.modpow(d, n),
+                Some(RoundtripVerification::Full { d, .. })
+                | Some(RoundtripVerification::Peek { d }) => ciphertext.modpow(d, n),
                 None => {
                     return Err(
-                        "engine.message.is_encrypted requires RSA private material so the ciphertext payload can be recovered"
+                        "engine.message.is_encrypted requires RSA private material or rsa_keypair.private_keyfile so the ciphertext payload can be recovered"
                             .into(),
                     )
                 }
@@ -467,18 +474,42 @@ fn uses_public_keyfile_only(config: &Config) -> bool {
 /// - Reads the configured private keyfile when present; no stdout/stderr output on success.
 fn load_private_keyfile_peek(
     config: &Config,
-    _expected_modulus: &BigUint,
-    _expected_exponent: &BigUint,
+    expected_modulus: &BigUint,
+    expected_exponent: &BigUint,
 ) -> Result<Option<RoundtripVerification>, Box<dyn Error>> {
     let private_keyfile = config.rsa_keypair.private_keyfile.trim();
     if private_keyfile.is_empty() {
         return Ok(None);
     }
 
-    Err(
-        "rsa_keypair.private_keyfile support is not available in fuel; provide inline primes or skip the private verification peek"
-            .into(),
-    )
+    let config_path = config
+        .source_path
+        .as_deref()
+        .ok_or("relative rsa_keypair.private_keyfile requires a loaded config path")?;
+    let material = load_rsa_key_material_from_config_keyfile(config_path, private_keyfile)?;
+    if material.format != RsaKeyFileFormat::PrivateKeyV1 {
+        return Err(format!(
+            "rsa_keypair.private_keyfile must reference an rsa-private-key-v1 file, got {:?}",
+            material.format
+        )
+        .into());
+    }
+    if material.modulus != *expected_modulus {
+        return Err(
+            "rsa_keypair.private_keyfile modulus does not match rsa_keypair.keyfile".into(),
+        );
+    }
+
+    if BigUint::from(material.public_exponent) != *expected_exponent {
+        return Err(
+            "rsa_keypair.private_keyfile public exponent does not match rsa_keypair.keyfile".into(),
+        );
+    }
+
+    let d = material
+        .private_exponent
+        .ok_or("rsa_keypair.private_keyfile is missing private_exponent")?;
+    Ok(Some(RoundtripVerification::Peek { d }))
 }
 
 /// Returns whether public-key-only analysis should prefer beam score over private-match ordering.
@@ -608,7 +639,7 @@ pub fn run_demo(
             .rsa_keypair
             .modulus
             .clone()
-            .ok_or("config.rsa_keypair.modulus must be set when generate is false and no inline primes are configured")?;
+            .ok_or("config.rsa_keypair.keyfile must provide a modulus when generate is false and no inline primes are configured")?;
         let e = BigUint::from(start_e);
         let roundtrip_verification = load_private_keyfile_peek(&config, &n, &e)?;
         (n.clone(), e, n.bits(), roundtrip_verification)
@@ -672,7 +703,9 @@ pub fn run_demo(
     let recovered = if let Some(verification) = roundtrip_verification.as_ref() {
         let roundtrip_start = Instant::now();
         let recovered = match verification {
-            RoundtripVerification::Full { d, .. } => ciphertext.modpow(d, &n),
+            RoundtripVerification::Full { d, .. } | RoundtripVerification::Peek { d } => {
+                ciphertext.modpow(d, &n)
+            }
         };
         if recovered != message {
             return Err("RSA round trip failed".into());

@@ -37,10 +37,10 @@ pub struct KeyConfig {
     /// Whether to generate keys instead of using provided values.
     #[serde(default = "default_generate")]
     pub generate: bool,
-    /// Relative or absolute keypair path retained for compatibility with older configs.
+    /// Relative or absolute YAML keypair path used when `p`/`q` are not configured.
     #[serde(default = "default_keyfile")]
     pub keyfile: String,
-    /// Optional private-key path retained for compatibility with older configs.
+    /// Optional private-key YAML path used only for verification peeks when the main keyfile is public.
     #[serde(default = "default_keyfile")]
     pub private_keyfile: String,
     /// RSA prime p (required when not generating).
@@ -52,9 +52,37 @@ pub struct KeyConfig {
     /// RSA public exponent.
     #[serde(default = "default_e")]
     pub e: u64,
-    /// RSA modulus populated from inline key material when available.
+    /// RSA modulus hydrated from inline primes or a YAML keyfile when available.
     #[serde(skip)]
     pub modulus: Option<BigUint>,
+}
+
+/// Supported RSA YAML keyfile formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RsaKeyFileFormat {
+    /// `rsa-private-key-v1` with modulus, exponent, primes, totient, and private exponent.
+    PrivateKeyV1,
+    /// `rsa-public-key-v1` with modulus and public exponent only.
+    PublicKeyV1,
+}
+
+/// Parsed RSA YAML key material loaded from a public or private keyfile.
+#[derive(Debug, Clone)]
+pub struct RsaKeyMaterial {
+    /// Parsed YAML format identifier.
+    pub format: RsaKeyFileFormat,
+    /// RSA modulus `n`.
+    pub modulus: BigUint,
+    /// RSA public exponent `e`.
+    pub public_exponent: u64,
+    /// RSA private exponent `d` when the keyfile is private.
+    pub private_exponent: Option<BigUint>,
+    /// Euler totient `phi(n)` when the keyfile is private.
+    pub totient: Option<BigUint>,
+    /// Prime `p` when the keyfile is private.
+    pub p: Option<BigUint>,
+    /// Prime `q` when the keyfile is private.
+    pub q: Option<BigUint>,
 }
 
 /// Message configuration for generating plaintexts.
@@ -562,6 +590,7 @@ pub fn load_config(path: &str) -> Result<Config, Box<dyn Error>> {
         .map_err(|err| format!("failed to parse config file {path}: {err}"))?;
 
     config.source_path = Some(cfg_path.to_path_buf());
+    hydrate_keypair_from_keyfile(cfg_path, &mut config.rsa_keypair)?;
     Ok(config)
 }
 
@@ -589,6 +618,235 @@ pub fn resolve_config_relative_path(
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(requested_path)
+}
+
+/// Resolves a keyfile path relative to the configuration file that references it.
+///
+/// # Parameters
+/// - `config_path`: Path to the JSON configuration file.
+/// - `keyfile`: Configured keyfile string, which may be relative or absolute.
+///
+/// # Returns
+/// - `PathBuf`: Resolved filesystem path to the requested keyfile.
+///
+/// # Expected Output
+/// - Returns a path value without touching the filesystem.
+pub fn resolve_keyfile_path(config_path: &Path, keyfile: &str) -> PathBuf {
+    resolve_config_relative_path(config_path, keyfile)
+}
+
+/// Parses one decimal bigint field from an RSA keyfile.
+///
+/// # Parameters
+/// - `field_name`: Human-readable field label for error reporting.
+/// - `raw`: Raw decimal field value from the YAML file.
+/// - `path`: Resolved keyfile path used for diagnostics.
+///
+/// # Returns
+/// - `Result<BigUint, Box<dyn Error>>`: Parsed bigint value.
+///
+/// # Expected Output
+/// - Returns a parsed bigint or an error; no stdout/stderr output.
+fn parse_keyfile_biguint(
+    field_name: &str,
+    raw: &str,
+    path: &Path,
+) -> Result<BigUint, Box<dyn Error>> {
+    raw.trim()
+        .parse::<BigUint>()
+        .map_err(|err| -> Box<dyn Error> {
+            format!(
+                "failed to parse {field_name} in keyfile {}: {err}",
+                path.display()
+            )
+            .into()
+        })
+}
+
+#[derive(Debug, Deserialize)]
+struct RsaKeyYamlEnvelope {
+    format: String,
+    algorithm: String,
+    public_exponent: String,
+    modulus: String,
+    #[serde(default)]
+    private_exponent: Option<String>,
+    #[serde(default)]
+    totient: Option<String>,
+    #[serde(default)]
+    primes: Option<RsaPrivateKeyYamlPrimes>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RsaPrivateKeyYamlPrimes {
+    p: String,
+    q: String,
+}
+
+/// Loads RSA key material from a resolved YAML keyfile path.
+///
+/// # Parameters
+/// - `resolved_path`: Filesystem path to the YAML keyfile.
+///
+/// # Returns
+/// - `Result<RsaKeyMaterial, Box<dyn Error>>`: Parsed RSA key material from the requested YAML file.
+///
+/// # Expected Output
+/// - Reads and deserializes the YAML file from disk; no stdout/stderr output on success.
+pub fn load_rsa_key_material_from_yaml_path(
+    resolved_path: &Path,
+) -> Result<RsaKeyMaterial, Box<dyn Error>> {
+    let raw = fs::read_to_string(resolved_path)?;
+    let parsed: RsaKeyYamlEnvelope =
+        serde_yaml::from_str(&raw).map_err(|err| -> Box<dyn Error> {
+            format!(
+                "failed to parse RSA keyfile {}: {err}",
+                resolved_path.display()
+            )
+            .into()
+        })?;
+
+    if parsed.algorithm.trim() != "RSA" {
+        return Err(format!(
+            "unsupported key algorithm {} in {}",
+            parsed.algorithm,
+            resolved_path.display()
+        )
+        .into());
+    }
+
+    let modulus = parse_keyfile_biguint("modulus", &parsed.modulus, resolved_path)?;
+    let public_exponent =
+        parsed
+            .public_exponent
+            .trim()
+            .parse::<u64>()
+            .map_err(|err| -> Box<dyn Error> {
+                format!(
+                    "failed to parse public_exponent in keyfile {}: {err}",
+                    resolved_path.display()
+                )
+                .into()
+            })?;
+
+    match parsed.format.trim() {
+        "rsa-private-key-v1" => {
+            let private_exponent_raw = parsed.private_exponent.as_deref().ok_or_else(|| {
+                format!(
+                    "rsa-private-key-v1 file {} is missing private_exponent",
+                    resolved_path.display()
+                )
+            })?;
+            let totient_raw = parsed.totient.as_deref().ok_or_else(|| {
+                format!(
+                    "rsa-private-key-v1 file {} is missing totient",
+                    resolved_path.display()
+                )
+            })?;
+            let primes = parsed.primes.ok_or_else(|| {
+                format!(
+                    "rsa-private-key-v1 file {} is missing primes",
+                    resolved_path.display()
+                )
+            })?;
+            let private_exponent =
+                parse_keyfile_biguint("private_exponent", private_exponent_raw, resolved_path)?;
+            let totient = parse_keyfile_biguint("totient", totient_raw, resolved_path)?;
+            let p = parse_keyfile_biguint("primes.p", &primes.p, resolved_path)?;
+            let q = parse_keyfile_biguint("primes.q", &primes.q, resolved_path)?;
+            Ok(RsaKeyMaterial {
+                format: RsaKeyFileFormat::PrivateKeyV1,
+                modulus,
+                public_exponent,
+                private_exponent: Some(private_exponent),
+                totient: Some(totient),
+                p: Some(p),
+                q: Some(q),
+            })
+        }
+        "rsa-public-key-v1" => {
+            if parsed.private_exponent.is_some()
+                || parsed.totient.is_some()
+                || parsed.primes.is_some()
+            {
+                return Err(format!(
+                    "rsa-public-key-v1 file {} must not include private_exponent, totient, or primes",
+                    resolved_path.display()
+                )
+                .into());
+            }
+            Ok(RsaKeyMaterial {
+                format: RsaKeyFileFormat::PublicKeyV1,
+                modulus,
+                public_exponent,
+                private_exponent: None,
+                totient: None,
+                p: None,
+                q: None,
+            })
+        }
+        other => Err(format!(
+            "unsupported RSA keyfile format {other} in {}",
+            resolved_path.display()
+        )
+        .into()),
+    }
+}
+
+/// Loads RSA key material from a configuration-relative YAML keyfile path.
+///
+/// # Parameters
+/// - `config_path`: Path to the JSON/JSON5 configuration file requesting the key.
+/// - `keyfile`: Configured YAML keyfile path, relative to `config_path` when not absolute.
+///
+/// # Returns
+/// - `Result<RsaKeyMaterial, Box<dyn Error>>`: Parsed RSA key material from the requested YAML file.
+///
+/// # Expected Output
+/// - Reads and deserializes the YAML file from disk; no stdout/stderr output on success.
+pub fn load_rsa_key_material_from_config_keyfile(
+    config_path: &Path,
+    keyfile: &str,
+) -> Result<RsaKeyMaterial, Box<dyn Error>> {
+    let resolved_path = resolve_keyfile_path(config_path, keyfile);
+    load_rsa_key_material_from_yaml_path(&resolved_path)
+}
+
+/// Hydrates missing inline RSA key material from a configured YAML keyfile.
+///
+/// # Parameters
+/// - `config_path`: Path to the JSON/JSON5 configuration file.
+/// - `key_config`: Mutable RSA keypair configuration to backfill.
+///
+/// # Returns
+/// - `Result<(), Box<dyn Error>>`: `Ok(())` when hydration succeeds or is unnecessary.
+///
+/// # Expected Output
+/// - Reads the configured YAML keyfile when inline primes are absent; no stdout/stderr output on success.
+fn hydrate_keypair_from_keyfile(
+    config_path: &Path,
+    key_config: &mut KeyConfig,
+) -> Result<(), Box<dyn Error>> {
+    if key_config.generate {
+        return Ok(());
+    }
+
+    if let (Some(p), Some(q)) = (&key_config.p, &key_config.q) {
+        key_config.modulus = Some(p * q);
+        return Ok(());
+    }
+
+    let keyfile = key_config.keyfile.trim();
+    if keyfile.is_empty() {
+        return Ok(());
+    }
+
+    let material = load_rsa_key_material_from_config_keyfile(config_path, keyfile)?;
+    key_config.modulus = Some(material.modulus.clone());
+    key_config.e = material.public_exponent;
+    key_config.p = material.p;
+    key_config.q = material.q;
+    Ok(())
 }
 
 /// Deserializes an optional `BigUint` from a string or number JSON value.
@@ -2105,5 +2363,161 @@ mod tests {
         assert_eq!(config.source_path.as_deref(), Some(path.as_path()));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_load_config_hydrates_keypair_from_relative_keyfile() {
+        let temp_dir = temp_path("keyfile_relative");
+        fs::create_dir_all(temp_dir.join("keys")).expect("create temp config dir");
+        fs::write(
+            temp_dir.join("keys").join("sample.yaml"),
+            concat!(
+                "format: rsa-private-key-v1\n",
+                "algorithm: RSA\n",
+                "public_exponent: \"17\"\n",
+                "private_exponent: \"2753\"\n",
+                "modulus: \"3233\"\n",
+                "totient: \"3120\"\n",
+                "primes:\n",
+                "  p: \"61\"\n",
+                "  q: \"53\"\n",
+            ),
+        )
+        .expect("write keyfile");
+        fs::write(
+            temp_dir.join("config.json"),
+            concat!(
+                "{\n",
+                "  \"rsa_keypair\": {\n",
+                "    \"generate\": false,\n",
+                "    \"keyfile\": \"keys/sample.yaml\"\n",
+                "  }\n",
+                "}\n",
+            ),
+        )
+        .expect("write config");
+
+        let config = load_config(temp_dir.join("config.json").to_str().expect("utf8 path"))
+            .expect("load config");
+        assert_eq!(config.rsa_keypair.e, 17);
+        assert_eq!(config.rsa_keypair.modulus, Some(BigUint::from(3233u32)));
+        assert_eq!(config.rsa_keypair.p, Some(BigUint::from(61u8)));
+        assert_eq!(config.rsa_keypair.q, Some(BigUint::from(53u8)));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_load_config_prefers_inline_primes_over_keyfile() {
+        let temp_dir = temp_path("keyfile_inline_override");
+        fs::create_dir_all(temp_dir.join("keys")).expect("create temp config dir");
+        fs::write(
+            temp_dir.join("keys").join("sample.yaml"),
+            concat!(
+                "format: rsa-private-key-v1\n",
+                "algorithm: RSA\n",
+                "public_exponent: \"17\"\n",
+                "private_exponent: \"2753\"\n",
+                "modulus: \"3233\"\n",
+                "totient: \"3120\"\n",
+                "primes:\n",
+                "  p: \"61\"\n",
+                "  q: \"53\"\n",
+            ),
+        )
+        .expect("write keyfile");
+        fs::write(
+            temp_dir.join("config.json"),
+            concat!(
+                "{\n",
+                "  \"rsa_keypair\": {\n",
+                "    \"generate\": false,\n",
+                "    \"keyfile\": \"keys/sample.yaml\",\n",
+                "    \"e\": 65537,\n",
+                "    \"p\": \"71\",\n",
+                "    \"q\": \"67\"\n",
+                "  }\n",
+                "}\n",
+            ),
+        )
+        .expect("write config");
+
+        let config = load_config(temp_dir.join("config.json").to_str().expect("utf8 path"))
+            .expect("load config");
+        assert_eq!(config.rsa_keypair.e, 65537);
+        assert_eq!(config.rsa_keypair.modulus, Some(BigUint::from(4757u32)));
+        assert_eq!(config.rsa_keypair.p, Some(BigUint::from(71u8)));
+        assert_eq!(config.rsa_keypair.q, Some(BigUint::from(67u8)));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_load_config_hydrates_public_keyfile_without_primes() {
+        let temp_dir = temp_path("keyfile_public");
+        fs::create_dir_all(temp_dir.join("keys")).expect("create temp config dir");
+        fs::write(
+            temp_dir.join("keys").join("public.yaml"),
+            concat!(
+                "format: rsa-public-key-v1\n",
+                "algorithm: RSA\n",
+                "public_exponent: \"17\"\n",
+                "modulus: \"3233\"\n",
+                "bit_lengths:\n",
+                "  modulus_bits: 12\n",
+            ),
+        )
+        .expect("write public keyfile");
+        fs::write(
+            temp_dir.join("config.json"),
+            concat!(
+                "{\n",
+                "  \"rsa_keypair\": {\n",
+                "    \"generate\": false,\n",
+                "    \"keyfile\": \"keys/public.yaml\",\n",
+                "    \"private_keyfile\": \"keys/private.yaml\"\n",
+                "  }\n",
+                "}\n",
+            ),
+        )
+        .expect("write config");
+
+        let config = load_config(temp_dir.join("config.json").to_str().expect("utf8 path"))
+            .expect("load config");
+        assert_eq!(config.rsa_keypair.e, 17);
+        assert_eq!(config.rsa_keypair.modulus, Some(BigUint::from(3233u32)));
+        assert_eq!(config.rsa_keypair.p, None);
+        assert_eq!(config.rsa_keypair.q, None);
+        assert_eq!(config.rsa_keypair.private_keyfile, "keys/private.yaml");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_load_public_keyfile_rejects_private_fields() {
+        let temp_dir = temp_path("keyfile_public_rejects_private");
+        fs::create_dir_all(&temp_dir).expect("create temp config dir");
+        let path = temp_dir.join("public.yaml");
+        fs::write(
+            &path,
+            concat!(
+                "format: rsa-public-key-v1\n",
+                "algorithm: RSA\n",
+                "public_exponent: \"17\"\n",
+                "modulus: \"3233\"\n",
+                "private_exponent: \"2753\"\n",
+            ),
+        )
+        .expect("write malformed public keyfile");
+
+        let error = load_rsa_key_material_from_yaml_path(&path)
+            .expect_err("public keyfile with private fields should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("must not include private_exponent")
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }
